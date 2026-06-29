@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="18" height="18">
+  <!--
+    space_layout icon
+    Wings: 左右にクレセント形（括弧型ベジェ）の羽
+    Black fill + 透明背景 → macOS テンプレートイメージ（ライト/ダークモード自動対応）
+
+    Layout (content: x=13..51, y=13..51, gap=4px):
+      Left col (w=20) │gap│ Right col (w=14)
+      ────────────────┼───┼────────────────
+      TL h=22 (large) │   │ TR h=13 (small)
+                      │   │ gap
+      gap             │   │ BR h=21 (tall)
+      BL h=12 (short) │   │
+  -->
+
+  <!-- Left wing: 括弧型クレセント（左向き） -->
+  <path fill="#000" d="M 13,13 Q 1,13 1,32 Q 1,51 13,51 Z"/>
+
+  <!-- Right wing: mirror -->
+  <path fill="#000" d="M 51,13 Q 63,13 63,32 Q 63,51 51,51 Z"/>
+
+  <!-- Left column -->
+  <rect fill="#000" x="13" y="13" width="20" height="22" rx="2"/>  <!-- TL: large -->
+  <rect fill="#000" x="13" y="39" width="20" height="12" rx="2"/>  <!-- BL: wide/short -->
+
+  <!-- Right column -->
+  <rect fill="#000" x="37" y="13" width="14" height="13" rx="2"/>  <!-- TR: small -->
+  <rect fill="#000" x="37" y="30" width="14" height="21" rx="2"/>  <!-- BR: tall -->
+</svg>

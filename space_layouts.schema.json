@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "space_layouts.schema.json",
+  "title": "Hammerspoon SpaceLayouts",
+  "description": "1ファイル = 1モニタ構成のSpacesレイアウト定義（Kubernetes風）。ファイル名 space_layouts_<n>.yaml はラベルで、照合は screens のUUID集合で行う。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "screens"],
+  "properties": {
+    "apiVersion": {
+      "const": "v1",
+      "description": "APIバージョン（現在は v1 のみ）"
+    },
+    "kind": {
+      "const": "SpaceLayouts",
+      "description": "リソース種別"
+    },
+    "screens": {
+      "type": "object",
+      "description": "この構成に含まれる物理モニタ。キーはモニタのUUID（hs.screen:getUUID()）。このUUID集合がモニタ構成の識別子になる。",
+      "minProperties": 1,
+      "propertyNames": {
+        "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+      },
+      "additionalProperties": { "$ref": "#/$defs/screen" }
+    }
+  },
+  "$defs": {
+    "screen": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["spaces"],
+      "properties": {
+        "metadata": {
+          "$ref": "#/$defs/screenMetadata"
+        },
+        "spaces": {
+          "type": "array",
+          "description": "仮想デスクトップ(Space)リスト。配列の並び順がSpaceの並び順（index不要）。リストア時に使用。",
+          "items": { "$ref": "#/$defs/space" }
+        }
+      }
+    },
+    "screenMetadata": {
+      "type": "object",
+      "description": "モニタのメタデータ（ユーザー編集用。リストアには使用しない）。キャプチャ時に name/frame が自動入力される。その他のキーは自由に追加可能。",
+      "additionalProperties": true,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "モニタ名（hs.screen:name()）。キャプチャ時に自動入力。"
+        },
+        "frame": {
+          "$ref": "#/$defs/frame",
+          "description": "モニタの配置・解像度（hs.screen:frame()）。キャプチャ時に自動入力。リストアには使用しない。"
+        }
+      }
+    },
+    "space": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["windows"],
+      "properties": {
+        "type": {
+          "enum": ["user", "fullscreen"],
+          "default": "user",
+          "description": "user=通常Space, fullscreen=緑ボタン（フルスクリーン）で占有しているSpace"
+        },
+        "windows": {
+          "type": "array",
+          "description": "このSpaceに配置するウィンドウのリスト。リストア時に bundleID + title/titlePattern で照合する。",
+          "items": { "$ref": "#/$defs/window" }
+        }
+      }
+    },
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bundleID"],
+      "properties": {
+        "bundleID": {
+          "type": "string",
+          "description": "アプリのbundleID (例: com.googlecode.iterm2)"
+        },
+        "title": {
+          "type": "string",
+          "description": "ウィンドウタイトルの完全一致文字列。キャプチャ時に自動入力。titlePatternがあればそちらが優先される。"
+        },
+        "titlePattern": {
+          "type": "string",
+          "description": "ウィンドウタイトルのLuaパターン (例: '^MyApp - ')。可変タイトルのアプリに手動で追記する。titleより優先される。Luaパターン記法（PCREとは一部異なる）。"
+        },
+        "frame": {
+          "$ref": "#/$defs/frame",
+          "description": "ウィンドウの位置とサイズ（復元に使用）。キャプチャ時に自動入力。"
+        }
+      }
+    },
+    "frame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "w", "h"],
+      "description": "矩形領域（スクリーン座標系）",
+      "properties": {
+        "x": { "type": "number", "description": "左端のX座標" },
+        "y": { "type": "number", "description": "上端のY座標" },
+        "w": { "type": "number", "description": "幅" },
+        "h": { "type": "number", "description": "高さ" }
+      }
+    }
+  }
+}
