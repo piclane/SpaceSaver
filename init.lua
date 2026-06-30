@@ -72,7 +72,7 @@ obj.dataDir  = hs.configdir
 local YQ_DEFAULT = "/opt/homebrew/bin/yq"
 
 local SCREEN_SETTLE  = 2.0   -- 秒: モニター変化後、復元開始までのデバウンス
-local RESTORE_DELAY  = 1.5   -- 秒: Space追加/削除後、ウィンドウ移動までの待機
+local RESTORE_DELAY  = 1.0   -- 秒: Space追加/削除後、ウィンドウ移動までの待機
 local CAPTURE_SETTLE = 0.6   -- 秒: gotoSpace後、ウィンドウ取得までの待機
 local MC_STEP_DELAY  = 0.6   -- 秒: Space追加/削除(Mission Control操作)の各ステップ間の待機
 
@@ -317,33 +317,40 @@ local function windowDescriptor(win)
   return ok and r or nil
 end
 
--- desc の titlePattern (Luaパターン) または title でウィンドウを照合する
-local function titleMatches(desc, win)
-  local ok, t = pcall(function() return win:title() or "" end)
-  local title = ok and t or ""
+-- desc の titlePattern (Luaパターン) または title でキャッシュ済みタイトル文字列を照合する
+local function titleMatches(desc, actualTitle)
   if desc.titlePattern then
-    return string.find(title, desc.titlePattern) ~= nil
+    return string.find(actualTitle, desc.titlePattern) ~= nil
   end
-  return title == (desc.title or "")
+  return actualTitle == (desc.title or "")
 end
 
--- pool（ウィンドウのリスト）から desc に最も近いウィンドウを取り出す
+-- pool（{ win=ウィンドウ, desc=windowDescriptor } のリスト）から desc に最も近いエントリを取り出す
+-- 戻り値: entry, matchKind
+--   matchKind = "title"  : bundleID + タイトル一致（優先1）
+--   matchKind = "bundle" : 同bundleIDのみ一致（フォールバック）
+--   matchKind = nil      : 不一致
 local function takeMatchingWindow(desc, pool)
   -- 優先1: bundleID + タイトル一致（パターン優先）
-  for i, win in ipairs(pool) do
-    local d = windowDescriptor(win)
-    if d and d.bundleID == desc.bundleID and titleMatches(desc, win) then
-      return table.remove(pool, i)
+  for i, entry in ipairs(pool) do
+    if entry.desc.bundleID == desc.bundleID and titleMatches(desc, entry.desc.title) then
+      return table.remove(pool, i), "title"
     end
   end
   -- 優先2: 同bundleIDのフォールバック
-  for i, win in ipairs(pool) do
-    local d = windowDescriptor(win)
-    if d and d.bundleID == desc.bundleID then
-      return table.remove(pool, i)
+  for i, entry in ipairs(pool) do
+    if entry.desc.bundleID == desc.bundleID then
+      return table.remove(pool, i), "bundle"
     end
   end
-  return nil
+  return nil, nil
+end
+
+-- desc のタイトル指定 (pattern または title) と bundleID を "[key]=[val] bundleID=[...]" で返す
+local function descKeyLabel(desc)
+  local key = desc.titlePattern and "pattern" or "title"
+  local val = desc.titlePattern or desc.title or ""
+  return string.format("%s=[%s] bundleID=[%s]", key, val, desc.bundleID or "")
 end
 
 -- spaceID がフルスクリーン型かどうか
@@ -470,6 +477,11 @@ end
 -- ============================================================
 
 local function restoreCurrentConfig()
+  if busy then
+    hs.alert.show("SpaceSaver: 処理中です。しばらくお待ちください")
+    return
+  end
+
   local set = currentScreenSet()
   local path, data = findConfigFile(set)
   if not path or not data then
@@ -477,8 +489,16 @@ local function restoreCurrentConfig()
     return
   end
 
-  print("SpaceSaver: [" .. basename(path) .. "] を復元")
-  hs.alert.show("SpaceSaver: [" .. basename(path) .. "] 復元中…", 3)
+  busy = true
+  print("SpaceSaver: [" .. basename(path) .. "] を復元開始")
+  hs.alert.show("SpaceSaver: [" .. basename(path) .. "] 復元中…操作しないでください", 999)
+
+  -- 巡回後に戻すため、現在のアクティブ Space を記録（capture と同じ）
+  local originalActive = {}
+  for uuid in pairs(set) do
+    local aok, sid = pcall(hs.spaces.activeSpaceOnScreen, uuid)
+    if aok and sid then originalActive[uuid] = sid end
+  end
 
   -- 対象画面ごとの計画を作る（現在接続中の画面のみ）
   -- plan = { uuid, spaces(レイアウト配列), target(目標user数) }
@@ -525,8 +545,23 @@ local function restoreCurrentConfig()
     end
   end
 
-  -- Space数調整の完了後に、各画面のウィンドウを配置する
-  local function placeWindows()
+  -- 元のアクティブ Space に戻して Mission Control を閉じ、完了通知する
+  local function finish()
+    for uuid, sid in pairs(originalActive) do
+      pcall(hs.spaces.gotoSpace, sid)
+    end
+    hs.timer.doAfter(CAPTURE_SETTLE, function()
+      pcall(hs.spaces.closeMissionControl)
+      busy = false
+      hs.alert.closeAll()
+      hs.alert.show("SpaceSaver: [" .. basename(path) .. "] 復元完了")
+      print("SpaceSaver: [" .. basename(path) .. "] 復元完了")
+    end)
+  end
+
+  -- 事前に収集したウィンドウプールを使って各画面のウィンドウを配置する
+  -- pool 要素は { win=ウィンドウ, desc=windowDescriptor } のキャッシュ済みエントリ
+  local function placeWindows(pool)
     for _, plan in ipairs(screenPlans) do
       -- user Space のみを並び順どおりに抽出（fullscreen を除外）。
       -- レイアウトの user Space 配列は、この userSpaceIDs に順番で対応する。
@@ -534,15 +569,22 @@ local function restoreCurrentConfig()
       for _, sid in ipairs(hs.spaces.spacesForScreen(plan.uuid) or {}) do
         if not spaceIsFullscreen(sid) then table.insert(userSpaceIDs, sid) end
       end
-      local pool = hs.window.allWindows()
       local userIdx = 0
 
       for _, sp in ipairs(plan.spaces) do
         if (sp.type or "user") == "fullscreen" then
           -- フルスクリーンSpace: 対応ウィンドウを setFullScreen(true) で全画面化
           for _, desc in ipairs(sp.windows or {}) do
-            local win = takeMatchingWindow(desc, pool)
-            if win then pcall(function() win:setFullScreen(true) end) end
+            local entry, matchKind = takeMatchingWindow(desc, pool)
+            if entry then
+              pcall(function() entry.win:setFullScreen(true) end)
+              local note = matchKind == "bundle" and " (bundleIDのみ一致)" or ""
+              print(string.format("配置 %s actualTitle=[%s] -> screen=[%s] fullscreen%s",
+                descKeyLabel(desc), entry.desc.title, plan.uuid, note))
+            else
+              print(string.format("未配置 %s actualTitle=[] reason=[該当ウィンドウなし]",
+                descKeyLabel(desc)))
+            end
           end
         else
           -- user Space: 配列順に spaceID と対応付けてウィンドウを移動・リサイズ
@@ -550,45 +592,104 @@ local function restoreCurrentConfig()
           local sid = userSpaceIDs[userIdx]
           if sid then
             for _, desc in ipairs(sp.windows or {}) do
-              local win = takeMatchingWindow(desc, pool)
-              if win then
-                pcall(function()
-                  hs.spaces.moveWindowToSpace(win, sid, true)
+              local entry, matchKind = takeMatchingWindow(desc, pool)
+              if entry then
+                local placeOk, placeErr = pcall(function()
+                  hs.spaces.moveWindowToSpace(entry.win, sid, true)
                   if desc.frame then
-                    win:setFrame(hs.geometry.rect(
+                    entry.win:setFrame(hs.geometry.rect(
                       desc.frame.x, desc.frame.y,
                       desc.frame.w, desc.frame.h))
                   end
                 end)
+                if placeOk then
+                  local note = matchKind == "bundle" and " (bundleIDのみ一致)" or ""
+                  print(string.format("配置 %s actualTitle=[%s] -> screen=[%s] userSpace#%d spaceID=[%s]%s",
+                    descKeyLabel(desc), entry.desc.title, plan.uuid, userIdx, tostring(sid), note))
+                else
+                  print(string.format("未配置 %s actualTitle=[%s] reason=[配置失敗: %s]",
+                    descKeyLabel(desc), entry.desc.title, tostring(placeErr)))
+                end
+              else
+                print(string.format("未配置 %s actualTitle=[] reason=[該当ウィンドウなし]",
+                  descKeyLabel(desc)))
               end
+            end
+          else
+            -- 実 Space 数が YAML の user Space 数より少ない場合
+            for _, desc in ipairs(sp.windows or {}) do
+              print(string.format("未配置 %s actualTitle=[] reason=[対象Spaceなし (userSpace#%d)]",
+                descKeyLabel(desc), userIdx))
             end
           end
         end
       end
     end
+    finish()
+  end
+
+  -- 全画面の全 Space を巡回してウィンドウプールを構築し、placeWindows を呼ぶ。
+  -- キャプチャの step() と同じ方式で非アクティブ Space のウィンドウも確実に収集する。
+  local function buildPoolAndPlace()
+    local worklist = {}
+    for _, plan in ipairs(screenPlans) do
+      for _, sid in ipairs(hs.spaces.spacesForScreen(plan.uuid) or {}) do
+        table.insert(worklist, { sid = sid })
+      end
+    end
+    local pool, seen = {}, {}
+    local function step(i)
+      if i > #worklist then placeWindows(pool); return end
+      pcall(hs.spaces.gotoSpace, worklist[i].sid)
+      hs.timer.doAfter(CAPTURE_SETTLE, function()
+        local wok, winIDs = pcall(hs.spaces.windowsForSpace, worklist[i].sid)
+        if wok and winIDs then
+          for _, wid in ipairs(winIDs) do
+            if not seen[wid] then
+              local win = hs.window.get(wid)
+              local isStd = false
+              if win then pcall(function() isStd = win:isStandard() end) end
+              if win and isStd then
+                local desc = windowDescriptor(win)
+                if desc then
+                  seen[wid] = true
+                  table.insert(pool, { win = win, desc = desc })
+                end
+              end
+            end
+          end
+        end
+        step(i + 1)
+      end)
+    end
+    if #worklist == 0 then placeWindows(pool) else step(1) end
   end
 
   -- 操作キューを1つずつ非同期で実行（Mission Control の競合を避けるため逐次・遅延つき）
   local function runOps(i)
     if i > #ops then
       pcall(hs.spaces.closeMissionControl)
-      hs.timer.doAfter(RESTORE_DELAY, placeWindows)
+      hs.timer.doAfter(RESTORE_DELAY, buildPoolAndPlace)
       return
     end
     local op = ops[i]
     if op.kind == "add" then
       pcall(hs.spaces.addSpaceToScreen, op.uuid, false)
+      hs.timer.doAfter(MC_STEP_DELAY, function() runOps(i + 1) end)
     elseif op.kind == "goto" then
       pcall(hs.spaces.gotoSpace, op.sid)
+      hs.timer.doAfter(MC_STEP_DELAY, function() runOps(i + 1) end)
     elseif op.kind == "remove" then
       pcall(hs.spaces.removeSpace, op.sid, false)
+      hs.timer.doAfter(MC_STEP_DELAY, function() runOps(i + 1) end)
+    else
+      runOps(i + 1)
     end
-    hs.timer.doAfter(MC_STEP_DELAY, function() runOps(i + 1) end)
   end
 
   if #ops == 0 then
-    -- 既に数が合っている場合は調整不要。すぐ配置する
-    placeWindows()
+    -- 既に数が合っている場合は調整不要。すぐプール構築→配置する
+    buildPoolAndPlace()
   else
     runOps(1)
   end
