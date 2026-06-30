@@ -41,6 +41,9 @@
     - yq (https://github.com/mikefarah/yq) v4 が
       /opt/homebrew/bin/yq または PATH に存在すること
     - （推奨）「視差効果を減らす」を有効にするとキャプチャ中の画面切替が目立たなくなる
+    - （macOS 15.x=Sequoia のみ）システム設定 > キーボード > Mission Control >
+      「操作スペースを左/右に移動」ショートカットが有効であり、
+      spaceSwitchHotkeys の設定と一致していること
 
   既知の制限:
     - Luaパターン照合（完全なPCREではない）
@@ -49,6 +52,8 @@
     - キャプチャ中はMission Controlが各Spaceぶん切り替わる
     - 再キャプチャでscreen.metadata.name/frameは実情報で上書き（ユーザーが追加した他キーは温存）
     - yq不在時はJSONフォールバック（space_layouts_<n>.json）で動作
+    - macOS 15.x (Sequoia): ドラッグ方式でウィンドウを移動するため、
+      復元中にマウスカーソルが動く。1ウィンドウあたり数百ms〜数秒かかる
 --]]
 
 local obj = {}
@@ -64,6 +69,23 @@ obj.license  = "MIT - https://opensource.org/licenses/MIT"
 -- space_layouts_*.yaml の保存先。デフォルトは hs.configdir (~/.hammerspoon)。
 -- :start() の前に上書き可能。
 obj.dataDir  = hs.configdir
+
+-- macOS 15.x (Sequoia) 専用: ドラッグ方式 Space 移動で送出するショートカット。
+-- macOS「システム設定 > キーボード > Mission Control >
+--   操作スペースを左/右に移動」の設定と一致させること。
+-- 形式は bindHotkeys と同じ {{修飾キー...}, キー}。:start() の前後どちらでも上書き可。
+-- 例（カスタム設定の場合）:
+--   spoon.SpaceSaver.spaceSwitchHotkeys = {
+--     left  = {{"ctrl","alt","cmd"}, "f10"},
+--     right = {{"ctrl","alt","cmd"}, "f12"},
+--   }
+obj.spaceSwitchHotkeys = {
+  left  = {{"ctrl"}, "left"},   -- 左の Space へ
+  right = {{"ctrl"}, "right"},  -- 右の Space へ
+}
+
+-- Sequoia 専用 moveWindowToSpace 代替モジュール（sequoia_move.lua）を読み込む
+local seqMove = dofile(hs.spoons.resourcePath("sequoia_move.lua"))
 
 -- ============================================================
 -- 設定定数
@@ -559,9 +581,15 @@ local function restoreCurrentConfig()
     end)
   end
 
-  -- 事前に収集したウィンドウプールを使って各画面のウィンドウを配置する
-  -- pool 要素は { win=ウィンドウ, desc=windowDescriptor } のキャッシュ済みエントリ
+  -- 事前に収集したウィンドウプールを使って各画面のウィンドウを配置する。
+  -- pool 要素は { win=ウィンドウ, desc=windowDescriptor } のキャッシュ済みエントリ。
+  -- ① タスクリストを同期的に構築（pool消費順を現状維持）し、
+  -- ② seqMove.moveWindowToSpace で逐次・非同期に実行する。
+  --    macOS 15.x(Sequoia): ドラッグ方式（非同期・数秒/ウィンドウ）
+  --    それ以外            : hs.spaces.moveWindowToSpace（ほぼ即時）
   local function placeWindows(pool)
+    -- ① タスクリスト構築（pool.takeMatchingWindow の消費順を現状と同一に保つ）
+    local tasks = {}
     for _, plan in ipairs(screenPlans) do
       -- user Space のみを並び順どおりに抽出（fullscreen を除外）。
       -- レイアウトの user Space 配列は、この userSpaceIDs に順番で対応する。
@@ -573,43 +601,35 @@ local function restoreCurrentConfig()
 
       for _, sp in ipairs(plan.spaces) do
         if (sp.type or "user") == "fullscreen" then
-          -- フルスクリーンSpace: 対応ウィンドウを setFullScreen(true) で全画面化
+          -- フルスクリーンSpace: setFullScreen(true) タスク
           for _, desc in ipairs(sp.windows or {}) do
             local entry, matchKind = takeMatchingWindow(desc, pool)
             if entry then
-              pcall(function() entry.win:setFullScreen(true) end)
-              local note = matchKind == "bundle" and " (bundleIDのみ一致)" or ""
-              print(string.format("配置 %s actualTitle=[%s] -> screen=[%s] fullscreen%s",
-                descKeyLabel(desc), entry.desc.title, plan.uuid, note))
+              table.insert(tasks, {
+                kind = "fullscreen",
+                win = entry.win, desc = desc,
+                actualTitle = entry.desc.title, matchKind = matchKind,
+                uuid = plan.uuid,
+              })
             else
               print(string.format("未配置 %s actualTitle=[] reason=[該当ウィンドウなし]",
                 descKeyLabel(desc)))
             end
           end
         else
-          -- user Space: 配列順に spaceID と対応付けてウィンドウを移動・リサイズ
+          -- user Space: Space 移動タスク
           userIdx = userIdx + 1
           local sid = userSpaceIDs[userIdx]
           if sid then
             for _, desc in ipairs(sp.windows or {}) do
               local entry, matchKind = takeMatchingWindow(desc, pool)
               if entry then
-                local placeOk, placeErr = pcall(function()
-                  hs.spaces.moveWindowToSpace(entry.win, sid, true)
-                  if desc.frame then
-                    entry.win:setFrame(hs.geometry.rect(
-                      desc.frame.x, desc.frame.y,
-                      desc.frame.w, desc.frame.h))
-                  end
-                end)
-                if placeOk then
-                  local note = matchKind == "bundle" and " (bundleIDのみ一致)" or ""
-                  print(string.format("配置 %s actualTitle=[%s] -> screen=[%s] userSpace#%d spaceID=[%s]%s",
-                    descKeyLabel(desc), entry.desc.title, plan.uuid, userIdx, tostring(sid), note))
-                else
-                  print(string.format("未配置 %s actualTitle=[%s] reason=[配置失敗: %s]",
-                    descKeyLabel(desc), entry.desc.title, tostring(placeErr)))
-                end
+                table.insert(tasks, {
+                  kind = "space",
+                  win = entry.win, desc = desc,
+                  actualTitle = entry.desc.title, matchKind = matchKind,
+                  sid = sid, uuid = plan.uuid, userIdx = userIdx,
+                })
               else
                 print(string.format("未配置 %s actualTitle=[] reason=[該当ウィンドウなし]",
                   descKeyLabel(desc)))
@@ -625,7 +645,31 @@ local function restoreCurrentConfig()
         end
       end
     end
-    finish()
+
+    -- ② タスクを逐次・非同期で実行（Sequoia はドラッグ方式なので1件ずつ待つ）
+    local function runTask(i)
+      if i > #tasks then finish(); return end
+      local t = tasks[i]
+      if t.kind == "fullscreen" then
+        pcall(function() t.win:setFullScreen(true) end)
+        local note = t.matchKind == "bundle" and " (bundleIDのみ一致)" or ""
+        print(string.format("配置 %s actualTitle=[%s] -> screen=[%s] fullscreen%s",
+          descKeyLabel(t.desc), t.actualTitle, t.uuid, note))
+        runTask(i + 1)
+      elseif t.kind == "space" then
+        seqMove.moveWindowToSpace(t.win, t.sid, t.desc.frame, obj.spaceSwitchHotkeys,
+          function()
+            local note = t.matchKind == "bundle" and " (bundleIDのみ一致)" or ""
+            print(string.format("配置 %s actualTitle=[%s] -> screen=[%s] userSpace#%d spaceID=[%s]%s",
+              descKeyLabel(t.desc), t.actualTitle, t.uuid, t.userIdx, tostring(t.sid), note))
+            runTask(i + 1)
+          end)
+      else
+        runTask(i + 1)
+      end
+    end
+
+    runTask(1)
   end
 
   -- 全画面の全 Space を巡回してウィンドウプールを構築し、placeWindows を呼ぶ。

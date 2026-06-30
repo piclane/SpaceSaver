@@ -57,6 +57,7 @@ SpaceSaver はこの問題を次のように解決します：
 * [yq](https://github.com/mikefarah/yq) v4（YAML 入出力に使用。なければ JSON フォールバック）
 * macOS のシステム設定：**デスクトップとDock > 「ディスプレイごとに異なるSpaceを表示」を有効**
 * Hammerspoon に **アクセシビリティ権限** を付与
+* **macOS 15.x (Sequoia) のみ**：システム設定 > キーボード > キーボードショートカット > Mission Control で **「操作スペースを左/右に移動」ショートカットが有効**（→ [Sequoia でのウィンドウ復元](#macos-sequoia-でのウィンドウ復元) を参照）
 
 # Installation
 
@@ -179,6 +180,67 @@ spoon.SpaceSaver:start()
 ```
 
 > 保存先を変更した場合、既存の `space_layouts_*.yaml` は新しいディレクトリへ手動で移動してください。デフォルトのまま使う場合は移行不要です（`~/.hammerspoon/` に置かれた既存ファイルがそのまま使われます）。
+
+---
+
+## macOS Sequoia でのウィンドウ復元
+
+macOS 15.x (Sequoia) では、Hammerspoon が内部で使用していた private API が削除され、`hs.spaces.moveWindowToSpace` が動作しなくなりました（[Hammerspoon issue #3698](https://github.com/Hammerspoon/hammerspoon/issues/3698)）。
+
+SpaceSaver は Sequoia 上でのみ、以下の**ドラッグ方式**で代替します：
+
+1. ウィンドウのタイトルバーをマウスでつかむ（`leftMouseDown` + 1px ドラッグ）
+2. ドラッグを保持したまま macOS の「操作スペースを左/右に移動」ショートカットを送出し、目的の Space まで 1 つずつ移動する
+3. マウスを放してウィンドウを正確な位置・サイズに補正する
+
+このため **復元中にマウスカーソルが動き**、ウィンドウ 1 つの移動に数百 ms〜数秒かかります。macOS 14 (Sonoma) 以下、および macOS 26 (Tahoe) 以降では従来の API を使用するため、この挙動はありません。
+
+### ショートカットの設定
+
+ドラッグ方式では、「操作スペースを左/右に移動」の **macOS 側のショートカット設定と `spaceSwitchHotkeys` を一致させる必要があります**。
+
+#### デフォルト（Ctrl + ←/→）
+
+macOS の初期設定のままであれば追加設定は不要です：
+
+```lua
+hs.loadSpoon("SpaceSaver")
+spoon.SpaceSaver:start()
+```
+
+#### カスタムショートカットを使っている場合
+
+「操作スペースを左/右に移動」に独自のショートカットを割り当てている場合は、`spaceSwitchHotkeys` を同じキー組み合わせに設定してください。**`:start()` の前に設定すること**：
+
+```lua
+hs.loadSpoon("SpaceSaver")
+
+-- macOS 側のショートカットに合わせて設定する（例: Ctrl+Alt+Cmd+F10/F12）
+spoon.SpaceSaver.spaceSwitchHotkeys = {
+  left  = {{"ctrl", "alt", "cmd"}, "f10"},   -- 左の Space へ移動
+  right = {{"ctrl", "alt", "cmd"}, "f12"},   -- 右の Space へ移動
+}
+
+spoon.SpaceSaver:start()
+```
+
+修飾キーには `"ctrl"`, `"alt"`, `"cmd"`, `"shift"` が使えます。キー名は [Hammerspoon の `hs.keycodes.map`](https://www.hammerspoon.org/docs/hs.keycodes.html) の値（`"f1"`〜`"f20"`, `"left"`, `"right"`, `"space"` など）に準じます。
+
+#### macOS 側のショートカット確認方法
+
+**システム設定 > キーボード > キーボードショートカット > Mission Control** を開き、「操作スペースを左に移動」「操作スペースを右に移動」の設定を確認します。
+
+> **ショートカットが無効になっている場合**は、チェックボックスをオンにして有効化してください。ドラッグ方式は macOS がこのショートカットを処理することで Space を切り替えるため、無効だと移動できません。
+
+### 既知の制限（Sequoia）
+
+| 制限 | 内容 |
+|---|---|
+| 速度 | 1 ウィンドウあたり数百 ms〜数秒。ウィンドウが多いほど復元に時間がかかる |
+| マウスカーソル | 復元中にカーソルが画面上を動く |
+| 隣接 Space のみ移動可 | 目的の Space が離れているほど時間がかかる（途中の Space を 1 つずつ通過する） |
+| フルスクリーン Space が挟まる場合 | user Space の間にフルスクリーン Space がある構成では移動が不安定になることがある |
+| cross-screen 移動 | 別スクリーン上のウィンドウはベストエフォート（`setFrame` で寄せてからドラッグ） |
 
 # Configuration Reference
 
@@ -361,6 +423,7 @@ screens:
 - 復元時に余剰な Space は削除しません（不足分の追加のみ）。不要な Space は手動で削除してください。
 - フルスクリーン Space の並び順は復元できません（ベストエフォート）。
 - 再キャプチャすると `screens.<UUID>.metadata.name` と `metadata.frame` は実モニタ情報で上書きされます。ユーザーが追加した他のメタデータキーは保持されます。
+- **macOS 15.x (Sequoia)**：ウィンドウ復元中にマウスカーソルが動きます。`spaceSwitchHotkeys` が macOS の「操作スペースを左/右に移動」ショートカットと一致していない場合、ウィンドウは移動されません（→ [macOS Sequoia でのウィンドウ復元](#macos-sequoia-でのウィンドウ復元)）。
 
 # Author
 
