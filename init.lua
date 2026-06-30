@@ -317,30 +317,36 @@ local function windowDescriptor(win)
   return ok and r or nil
 end
 
+-- titlePattern 中の "-" を常にリテラル "%-" として扱うために変換する。
+-- "-" は Lua パターンでは特殊文字（最短マッチ量指定子）なので、ユーザーが
+-- 直感的に書いた "Workspace -" がリテラルの "-" として照合されるようにする。
+-- 既にエスケープ済みの "%-" は二重エスケープしない。ワイルドカードが必要なら "*" を使う。
+local function escapeHyphens(pattern)
+  -- "%-"（エスケープ済み）または "-"（素）の両方を "%-" に正規化する
+  return (pattern:gsub("%%?%-", "%%-"))
+end
+
 -- desc の titlePattern (Luaパターン) または title でウィンドウを照合する
 local function titleMatches(desc, win)
   local ok, t = pcall(function() return win:title() or "" end)
   local title = ok and t or ""
   if desc.titlePattern then
-    return string.find(title, desc.titlePattern) ~= nil
+    return string.find(title, escapeHyphens(desc.titlePattern)) ~= nil
   end
   return title == (desc.title or "")
 end
 
--- pool（ウィンドウのリスト）から desc に最も近いウィンドウを取り出す
+-- pool（ウィンドウのリスト）から desc に一致するウィンドウを取り出す
+-- 戻り値: win, matchKind, actualTitle
+--   matchKind: "pattern"(titlePattern一致) / "title"(title完全一致)
+--   一致しなければ nil（同bundleIDの無条件フォールバックは行わない）
 local function takeMatchingWindow(desc, pool)
-  -- 優先1: bundleID + タイトル一致（パターン優先）
+  -- bundleID + タイトル一致（titlePattern 優先、なければ title 完全一致）
   for i, win in ipairs(pool) do
     local d = windowDescriptor(win)
     if d and d.bundleID == desc.bundleID and titleMatches(desc, win) then
-      return table.remove(pool, i)
-    end
-  end
-  -- 優先2: 同bundleIDのフォールバック
-  for i, win in ipairs(pool) do
-    local d = windowDescriptor(win)
-    if d and d.bundleID == desc.bundleID then
-      return table.remove(pool, i)
+      local kind = desc.titlePattern and "pattern" or "title"
+      return table.remove(pool, i), kind, d.title or ""
     end
   end
   return nil
@@ -478,7 +484,8 @@ local function restoreCurrentConfig()
   end
 
   print("SpaceSaver: [" .. basename(path) .. "] を復元")
-  hs.alert.show("SpaceSaver: [" .. basename(path) .. "] 復元中…", 3)
+  -- 復元完了まで表示し続ける（placeWindows 完了時に明示的に閉じる）
+  hs.alert.show("SpaceSaver: [" .. basename(path) .. "] 復元中…", 999)
 
   -- 対象画面ごとの計画を作る（現在接続中の画面のみ）
   -- plan = { uuid, spaces(レイアウト配列), target(目標user数) }
@@ -525,8 +532,15 @@ local function restoreCurrentConfig()
     end
   end
 
-  -- Space数調整の完了後に、各画面のウィンドウを配置する
-  local function placeWindows()
+  -- プールを使って実際にウィンドウを配置する。
+  -- フェーズA(同期): マッチングを確定し pool を消費する。fullscreen は即時全画面化、
+  --   user Space 行は移動タスクとして tasks に積む（実移動はフェーズBで行う）。
+  -- フェーズB(非同期): 移動先 Space を gotoSpace でアクティブ化してから移動する。
+  --   非アクティブ Space への連続 moveWindowToSpace は、moveOK=true でも別 Space へ
+  --   着地するレースがあるため、必ず「アクティブ化 → 移動」の順にする。
+  local function doPlacement(pool)
+    -- ---- フェーズA: マッチング ----
+    local tasks = {}  -- { {win, sid, frame, kind, pat, bundleID, actual, uuid, userIdx} }
     for _, plan in ipairs(screenPlans) do
       -- user Space のみを並び順どおりに抽出（fullscreen を除外）。
       -- レイアウトの user Space 配列は、この userSpaceIDs に順番で対応する。
@@ -534,38 +548,202 @@ local function restoreCurrentConfig()
       for _, sid in ipairs(hs.spaces.spacesForScreen(plan.uuid) or {}) do
         if not spaceIsFullscreen(sid) then table.insert(userSpaceIDs, sid) end
       end
-      local pool = hs.window.allWindows()
       local userIdx = 0
 
       for _, sp in ipairs(plan.spaces) do
         if (sp.type or "user") == "fullscreen" then
           -- フルスクリーンSpace: 対応ウィンドウを setFullScreen(true) で全画面化
           for _, desc in ipairs(sp.windows or {}) do
-            local win = takeMatchingWindow(desc, pool)
-            if win then pcall(function() win:setFullScreen(true) end) end
+            local pat = desc.titlePattern or desc.title or ""
+            local win, kind, actual = takeMatchingWindow(desc, pool)
+            if win then
+              pcall(function() win:setFullScreen(true) end)
+              print(string.format(
+                "SpaceSaver: 配置 match=%s pattern=[%s] bundleID=[%s] actualTitle=[%s] -> screen=[%s] fullscreen",
+                kind, pat, desc.bundleID, actual, plan.uuid))
+            else
+              print(string.format(
+                "SpaceSaver: 未配置(該当ウィンドウなし) pattern=[%s] bundleID=[%s] -> screen=[%s] fullscreen",
+                pat, desc.bundleID, plan.uuid))
+            end
           end
         else
-          -- user Space: 配列順に spaceID と対応付けてウィンドウを移動・リサイズ
+          -- user Space: 配列順に spaceID と対応付けて移動タスクを積む
           userIdx = userIdx + 1
           local sid = userSpaceIDs[userIdx]
-          if sid then
-            for _, desc in ipairs(sp.windows or {}) do
-              local win = takeMatchingWindow(desc, pool)
+          for _, desc in ipairs(sp.windows or {}) do
+            local pat = desc.titlePattern or desc.title or ""
+            if not sid then
+              -- レイアウトの user Space 数に対し実 Space が足りない
+              print(string.format(
+                "SpaceSaver: 未配置(対象Spaceなし) pattern=[%s] bundleID=[%s] -> screen=[%s] userSpace#%d",
+                pat, desc.bundleID, plan.uuid, userIdx))
+            else
+              local win, kind, actual = takeMatchingWindow(desc, pool)
               if win then
-                pcall(function()
-                  hs.spaces.moveWindowToSpace(win, sid, true)
-                  if desc.frame then
-                    win:setFrame(hs.geometry.rect(
-                      desc.frame.x, desc.frame.y,
-                      desc.frame.w, desc.frame.h))
-                  end
-                end)
+                table.insert(tasks, {
+                  win = win, sid = sid, frame = desc.frame,
+                  kind = kind, pat = pat, bundleID = desc.bundleID,
+                  actual = actual, uuid = plan.uuid, userIdx = userIdx,
+                })
+              else
+                print(string.format(
+                  "SpaceSaver: 未配置(該当ウィンドウなし) pattern=[%s] bundleID=[%s] -> screen=[%s] userSpace#%d spaceID=[%s]",
+                  pat, desc.bundleID, plan.uuid, userIdx, tostring(sid)))
               end
             end
           end
         end
       end
     end
+
+    -- ---- フェーズB: 移動先をアクティブ化してから1件ずつ移動 ----
+    -- 巡回後に戻すため、各スクリーンの現在アクティブSpaceを記録
+    local originalActive = {}
+    for _, scr in ipairs(hs.screen.allScreens()) do
+      local uuid = scr:getUUID()
+      local aok, sid = pcall(hs.spaces.activeSpaceOnScreen, uuid)
+      if aok and sid then originalActive[uuid] = sid end
+    end
+
+    local function finishPlacement()
+      -- 元のアクティブSpaceに戻す
+      for _, scr in ipairs(hs.screen.allScreens()) do
+        local sid = originalActive[scr:getUUID()]
+        if sid then pcall(hs.spaces.gotoSpace, sid) end
+      end
+      hs.timer.doAfter(CAPTURE_SETTLE, function()
+        pcall(hs.spaces.closeMissionControl)
+        hs.alert.closeAll()
+        print("SpaceSaver: [" .. basename(path) .. "] 復元完了")
+        hs.alert.show("SpaceSaver: [" .. basename(path) .. "] 復元完了")
+      end)
+    end
+
+    local lastActivated = nil
+    local function runTask(i)
+      if i > #tasks then finishPlacement(); return end
+      local t = tasks[i]
+
+      -- ウィンドウの現在の所属Space（複数なら先頭）を返す
+      local function currentSpaceOf(win)
+        local ok, sps = pcall(hs.spaces.windowSpaces, win)
+        if ok and type(sps) == "table" and sps[1] then return sps[1] end
+        return nil
+      end
+
+      local function moveNow()
+        local moveOK, moveErr = nil, nil
+        pcall(function()
+          moveOK, moveErr = hs.spaces.moveWindowToSpace(t.win, t.sid, true)
+        end)
+        -- 移動でアクティブSpaceが変わるため、フレーム設定は対象Spaceをアクティブ化してから行う
+        local landed = currentSpaceOf(t.win)
+        print(string.format(
+          "SpaceSaver: 配置 match=%s pattern=[%s] bundleID=[%s] actualTitle=[%s] -> screen=[%s] userSpace#%d spaceID=[%s] moveOK=%s err=%s landed=[%s]",
+          t.kind, t.pat, t.bundleID, t.actual, t.uuid, t.userIdx, tostring(t.sid),
+          tostring(moveOK), tostring(moveErr), tostring(landed)))
+
+        -- フレーム設定（必要時のみ。対象Spaceをアクティブ化してから setFrame）
+        if t.frame then
+          pcall(hs.spaces.gotoSpace, t.sid)
+          hs.timer.doAfter(MC_STEP_DELAY, function()
+            pcall(function()
+              t.win:setFrame(hs.geometry.rect(
+                t.frame.x, t.frame.y, t.frame.w, t.frame.h))
+            end)
+            runTask(i + 1)
+          end)
+        else
+          runTask(i + 1)
+        end
+      end
+
+      -- moveWindowToSpace は「対象ウィンドウが現在アクティブなSpaceに居る」ときしか
+      -- 機能しない（非アクティブSpaceのウィンドウは掴めず no-op になる）。
+      -- そのため、移動先ではなく「ウィンドウの現在のSpace」をアクティブ化してから動かす。
+      local cur = currentSpaceOf(t.win)
+      if cur == t.sid then
+        -- 既に目的Spaceに居る → 移動不要（フレーム調整のみ moveNow 内で実施）
+        moveNow()
+      elseif cur and cur == lastActivated then
+        -- 現在Spaceが既にアクティブ → 待たずに移動
+        moveNow()
+      elseif cur then
+        -- ウィンドウの現在Spaceをアクティブ化してから移動
+        pcall(hs.spaces.gotoSpace, cur)
+        lastActivated = cur
+        hs.timer.doAfter(MC_STEP_DELAY, moveNow)
+      else
+        -- 現在Spaceが取得できない場合はそのまま試行
+        moveNow()
+      end
+    end
+
+    runTask(1)
+  end
+
+  -- Space数調整の完了後に、各画面のウィンドウを配置する。
+  -- hs.window.get / allWindows は「現在表示中のSpace」のウィンドウしか解決できないため、
+  -- capture と同様に各Spaceを gotoSpace で巡回しながら window オブジェクトを集めてプール化する。
+  -- 集め終えてから doPlacement で配置する（別Space/フルスクリーンのウィンドウも取りこぼさない）。
+  local function placeWindows()
+    -- 巡回対象の全SpaceID（接続中スクリーン × Space順）
+    local sweepList = {}
+    for _, scr in ipairs(hs.screen.allScreens()) do
+      local uuid = scr:getUUID()
+      local sok, sids = pcall(hs.spaces.spacesForScreen, uuid)
+      if sok and sids then
+        for _, sid in ipairs(sids) do table.insert(sweepList, sid) end
+      end
+    end
+
+    -- 巡回後に戻すため、各スクリーンの現在アクティブSpaceを記録
+    local originalActive = {}
+    for _, scr in ipairs(hs.screen.allScreens()) do
+      local uuid = scr:getUUID()
+      local aok, sid = pcall(hs.spaces.activeSpaceOnScreen, uuid)
+      if aok and sid then originalActive[uuid] = sid end
+    end
+
+    local pool, seen = {}, {}
+
+    -- 1Spaceずつ gotoSpace してアクティブ化し、そのSpaceのウィンドウを収集
+    local function sweep(i)
+      if i > #sweepList then
+        -- 収集完了 → 元のアクティブSpaceに戻してから配置
+        for _, scr in ipairs(hs.screen.allScreens()) do
+          local sid = originalActive[scr:getUUID()]
+          if sid then pcall(hs.spaces.gotoSpace, sid) end
+        end
+        hs.timer.doAfter(CAPTURE_SETTLE, function()
+          pcall(hs.spaces.closeMissionControl)
+          doPlacement(pool)
+        end)
+        return
+      end
+      local sid = sweepList[i]
+      pcall(hs.spaces.gotoSpace, sid)
+      hs.timer.doAfter(CAPTURE_SETTLE, function()
+        local wok, winIDs = pcall(hs.spaces.windowsForSpace, sid)
+        if wok and winIDs then
+          for _, wid in ipairs(winIDs) do
+            if not seen[wid] then
+              seen[wid] = true
+              local win = hs.window.get(wid)
+              if win then
+                local isStd = false
+                pcall(function() isStd = win:isStandard() end)
+                if isStd then table.insert(pool, win) end
+              end
+            end
+          end
+        end
+        sweep(i + 1)
+      end)
+    end
+
+    sweep(1)
   end
 
   -- 操作キューを1つずつ非同期で実行（Mission Control の競合を避けるため逐次・遅延つき）
