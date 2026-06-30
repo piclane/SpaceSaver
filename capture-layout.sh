@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Hammerspoon の space_layout キャプチャをシェルから起動する
-# 使い方: ./capture-layout.sh
-# または: bash ~/.hammerspoon/capture-layout.sh
+# SpaceSaver Spoon のキャプチャをシェルから起動する
+# 使い方: ~/.hammerspoon/Spoons/SpaceSaver.spoon/capture-layout.sh
+# または直接: open -g "hammerspoon://space-capture"
 open -g "hammerspoon://space-capture"

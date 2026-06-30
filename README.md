@@ -14,7 +14,7 @@ macOS の Spaces はモニタを切り替えるたびにリセットされてし
 SpaceSaver はこの問題を次のように解決します：
 
 1. **キャプチャ**（手動・任意のタイミング）  
-   メニューバーアイコンまたはシェルコマンドで実行します。全 Space をひとつずつ自動で切り替えながら巡回し、各 Space に存在するウィンドウのアプリ情報・タイトル・位置・サイズを正確に記録します。記録結果は `~/.hammerspoon/space_layouts_<n>.yaml` に保存されます。**モニタ構成が異なるファイルには書き込まれないため**、自宅用・オフィス用・ノートPC単体用など複数の構成を独立して管理できます。
+   メニューバーアイコンまたはシェルコマンドで実行します。全 Space をひとつずつ自動で切り替えながら巡回し、各 Space に存在するウィンドウのアプリ情報・タイトル・位置・サイズを正確に記録します。記録結果はデータディレクトリ（デフォルト `~/.hammerspoon/`）の `space_layouts_<n>.yaml` に保存されます。**モニタ構成が異なるファイルには書き込まれないため**、自宅用・オフィス用・ノートPC単体用など複数の構成を独立して管理できます。
 
 2. **復元**（自動・モニタ接続変化時）  
    Dock の着脱やモニタの接続・切断を検出すると、接続中のモニタ UUID の集合をキーに対応する YAML ファイルを自動で選択します。Space の数が不足していれば補完し、各 Space へウィンドウを移動してウィンドウの位置・サイズも元通りに設定します。フルスクリーン（緑ボタン）で占有している Space にも対応します。
@@ -60,32 +60,39 @@ SpaceSaver はこの問題を次のように解決します：
 
 # Installation
 
+SpaceSaver は Hammerspoon の **Spoon**（`~/.hammerspoon/Spoons/SpaceSaver.spoon/`）として配置します。
+
 ### 1. yq をインストール
 
 ```bash
 brew install yq
 ```
 
-### 2. ファイルを `~/.hammerspoon/` に配置
+### 2. Spoon を配置
+
+リポジトリを `SpaceSaver.spoon` という名前で `~/.hammerspoon/Spoons/` にクローンします（`init.lua` / `space_layout.svg` / `space_layouts.schema.json` などを含みます）。
 
 ```bash
-# 必須
-cp space_layout.lua    ~/.hammerspoon/
-cp space_layout.svg    ~/.hammerspoon/
-
-# YAML エディタで補完・バリデーションを使いたい場合
-cp space_layouts.schema.json ~/.hammerspoon/
-
-# シェルからキャプチャを起動したい場合（任意）
-cp capture-layout.sh   ~/.hammerspoon/
-chmod +x ~/.hammerspoon/capture-layout.sh
+mkdir -p ~/.hammerspoon/Spoons
+git clone git@github.com:piclane/SpaceSaver.git ~/.hammerspoon/Spoons/SpaceSaver.spoon
 ```
+
+> エントリポイントは `init.lua` です。`space_layout.svg` と `space_layouts.schema.json` は Spoon バンドル内のリソースとして自動的に解決されます（手動コピー不要）。
 
 ### 3. `~/.hammerspoon/init.lua` に追記
 
 ```lua
-local spaceLayout = require("space_layout")
-spaceLayout.start()
+hs.loadSpoon("SpaceSaver")
+spoon.SpaceSaver:start()
+
+-- 任意: ホットキーを割り当てる
+-- spoon.SpaceSaver:bindHotkeys({
+--   capture = {{"cmd", "alt", "ctrl"}, "c"},
+--   restore = {{"cmd", "alt", "ctrl"}, "r"},
+-- })
+
+-- 任意: データ保存先を変更する（:start() の前に設定すること）
+-- spoon.SpaceSaver.dataDir = os.getenv("HOME") .. "/Documents/SpaceSaver-data"
 ```
 
 ### 4. Hammerspoon をリロード
@@ -108,10 +115,10 @@ spaceLayout.start()
 # シェルから
 open -g "hammerspoon://space-capture"
 # または
-~/.hammerspoon/capture-layout.sh
+~/.hammerspoon/Spoons/SpaceSaver.spoon/capture-layout.sh
 ```
 
-初回キャプチャで `~/.hammerspoon/space_layouts_1.yaml` が生成されます。
+初回キャプチャで、データディレクトリ（デフォルト `~/.hammerspoon/`）に `space_layouts_1.yaml` が生成されます。
 
 ### 設定ファイルの手動編集
 
@@ -145,18 +152,43 @@ open -g "hammerspoon://space-restore"
 
 ```lua
 -- Hammerspoon コンソールで実行
-spaceLayout.dump()
+spoon.SpaceSaver:dump()
 ```
+
+### ホットキー（任意）
+
+`bindHotkeys` でキャプチャ／復元にショートカットを割り当てられます。デフォルトの割り当てはありません（他の Spoon やシステムとの衝突を避けるため）。
+
+```lua
+spoon.SpaceSaver:bindHotkeys({
+  capture = {{"cmd", "alt", "ctrl"}, "c"},  -- レイアウトをキャプチャ
+  restore = {{"cmd", "alt", "ctrl"}, "r"},  -- レイアウトを復元
+})
+```
+
+`:start()` の前後どちらで呼んでも構いません。
+
+### データの保存先（任意）
+
+`space_layouts_*.yaml` の保存先は `dataDir` で変更できます。デフォルトは `hs.configdir`（= `~/.hammerspoon/`）です。
+
+```lua
+-- :start() を呼ぶ前に設定すること
+spoon.SpaceSaver.dataDir = os.getenv("HOME") .. "/Documents/SpaceSaver-data"
+spoon.SpaceSaver:start()
+```
+
+> 保存先を変更した場合、既存の `space_layouts_*.yaml` は新しいディレクトリへ手動で移動してください。デフォルトのまま使う場合は移行不要です（`~/.hammerspoon/` に置かれた既存ファイルがそのまま使われます）。
 
 # Configuration Reference
 
 キャプチャで生成される `space_layouts_<n>.yaml` のスキーマ詳細です。  
-`space_layouts.schema.json` が同じディレクトリにあれば VS Code（YAML 拡張）で補完・バリデーションが効きます。
+保存時、YAML 先頭の `$schema` には Spoon バンドル内 `space_layouts.schema.json` への**絶対パス**が自動で書き込まれるため、VS Code（YAML 拡張）で補完・バリデーションがそのまま効きます。
 
 ### ファイル全体の構造
 
 ```yaml
-# yaml-language-server: $schema=./space_layouts.schema.json
+# yaml-language-server: $schema=/Users/you/.hammerspoon/Spoons/SpaceSaver.spoon/space_layouts.schema.json
 apiVersion: v1          # 固定値
 kind: SpaceLayouts      # 固定値
 screens:                # モニタ UUID → screen オブジェクト のマップ
@@ -171,7 +203,7 @@ screens:                # モニタ UUID → screen オブジェクト のマッ
 | `kind` | `"SpaceLayouts"` | 固定。 |
 | `screens` | object | キーがモニタの UUID（`hs.screen:getUUID()`）。この UUID の集合がモニタ構成の識別子になる。 |
 
-> **ファイルの選択ロジック**：`~/.hammerspoon/space_layouts_*.yaml` を順に読み込み、`screens` のキー集合が現在接続中のモニタ UUID 集合と一致するファイルが選ばれます。ファイル名は単なるラベルであり、照合には使用しません。
+> **ファイルの選択ロジック**：データディレクトリ（デフォルト `~/.hammerspoon/`）の `space_layouts_*.yaml` を順に読み込み、`screens` のキー集合が現在接続中のモニタ UUID 集合と一致するファイルが選ばれます。ファイル名は単なるラベルであり、照合には使用しません。
 
 ---
 
@@ -273,7 +305,7 @@ frame: { x: 0, y: 25, w: 1920, h: 1055 }
 ### 完全な例
 
 ```yaml
-# yaml-language-server: $schema=./space_layouts.schema.json
+# yaml-language-server: $schema=/Users/you/.hammerspoon/Spoons/SpaceSaver.spoon/space_layouts.schema.json
 apiVersion: v1
 kind: SpaceLayouts
 screens:

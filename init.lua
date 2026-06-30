@@ -1,23 +1,34 @@
 --[[
-  space_layout.lua (v3)
+  SpaceSaver (init.lua) — Hammerspoon Spoon
   ----------------------------------------------------------------
   物理モニタ「構成」ごとに独立したYAMLファイルで
-  macOS Spacesレイアウトを保存・復元するHammerspoonモジュール。
+  macOS Spacesレイアウトを保存・復元するHammerspoon Spoon。
 
-  ファイル形式: ~/.hammerspoon/space_layouts_<n>.yaml (Kubernetes スタイル)
-  スキーマ:     ~/.hammerspoon/space_layouts.schema.json
+  ファイル形式: <dataDir>/space_layouts_<n>.yaml (Kubernetes スタイル)
+                dataDir のデフォルトは ~/.hammerspoon (hs.configdir)
+  スキーマ:     Spoon バンドル内の space_layouts.schema.json
+                （保存YAMLの $schema には絶対パスを自動付与）
 
-  使い方:
-    1. このファイルを ~/.hammerspoon/space_layout.lua に置く
+  インストール:
+    1. このフォルダを ~/.hammerspoon/Spoons/SpaceSaver.spoon/ に置く
     2. ~/.hammerspoon/init.lua に以下を追記:
-         local spaceLayout = require("space_layout")
-         spaceLayout.start()
+         hs.loadSpoon("SpaceSaver")
+         spoon.SpaceSaver:start()
     3. Hammerspoonをリロード (メニューバー > Reload Config)
+
+  （任意）ホットキー:
+         spoon.SpaceSaver:bindHotkeys({
+           capture = {{"cmd","alt","ctrl"}, "c"},
+           restore = {{"cmd","alt","ctrl"}, "r"},
+         })
+
+  （任意）データ保存先の変更（:start() の前に設定すること）:
+         spoon.SpaceSaver.dataDir = os.getenv("HOME") .. "/Documents/SpaceSaver-data"
 
   キャプチャ（手動）:
     - メニューバーの ⊞ > レイアウトをキャプチャ
     - open -g "hammerspoon://space-capture"
-    - ~/.hammerspoon/capture-layout.sh
+    - ~/.hammerspoon/Spoons/SpaceSaver.spoon/capture-layout.sh
 
   復元（自動）:
     - モニタ構成変更時（dock脱着など）に自動実行
@@ -40,26 +51,39 @@
     - yq不在時はJSONフォールバック（space_layouts_<n>.json）で動作
 --]]
 
-local M = {}
+local obj = {}
+obj.__index = obj
+
+-- Spoon メタデータ
+obj.name     = "SpaceSaver"
+obj.version  = "3.0.0"
+obj.author   = "piclane"
+obj.homepage = "https://github.com/piclane/SpaceSaver"
+obj.license  = "MIT - https://opensource.org/licenses/MIT"
+
+-- space_layouts_*.yaml の保存先。デフォルトは hs.configdir (~/.hammerspoon)。
+-- :start() の前に上書き可能。
+obj.dataDir  = hs.configdir
 
 -- ============================================================
 -- 設定定数
 -- ============================================================
 
-local HOME     = os.getenv("HOME")
-local HS_DIR   = HOME .. "/.hammerspoon"
 local YQ_DEFAULT = "/opt/homebrew/bin/yq"
 
 local SCREEN_SETTLE  = 2.0   -- 秒: モニター変化後、復元開始までのデバウンス
 local RESTORE_DELAY  = 1.5   -- 秒: Space追加後、ウィンドウ移動までの待機
 local CAPTURE_SETTLE = 0.6   -- 秒: gotoSpace後、ウィンドウ取得までの待機
 
--- 各YAMLファイルの先頭に付与するヘッダ
+-- 各YAMLファイルの先頭に付与するヘッダを返す
 -- "screens:" は yq の変換出力がそのまま続くので、ここには含めない
-local YAML_HEADER =
-  "# yaml-language-server: $schema=./space_layouts.schema.json\n" ..
-  "apiVersion: v1\n" ..
-  "kind: SpaceLayouts\n"
+-- $schema は Spoon バンドル内スキーマの絶対パス（エディタ検証用）
+local function yamlHeader()
+  local schemaPath = hs.spoons.resourcePath("space_layouts.schema.json")
+  return "# yaml-language-server: $schema=" .. schemaPath .. "\n" ..
+         "apiVersion: v1\n" ..
+         "kind: SpaceLayouts\n"
+end
 
 -- ============================================================
 -- 内部状態
@@ -136,9 +160,9 @@ local function listConfigFiles()
   local pat = "^space_layouts_.+%." .. ext .. "$"
   local files = {}
   pcall(function()
-    for name in hs.fs.dir(HS_DIR) do
+    for name in hs.fs.dir(obj.dataDir) do
       if name:match(pat) then
-        table.insert(files, HS_DIR .. "/" .. name)
+        table.insert(files, obj.dataDir .. "/" .. name)
       end
     end
   end)
@@ -179,10 +203,10 @@ end
 local function nextConfigFilePath()
   local ext = configExt()
   local i = 1
-  while hs.fs.attributes(HS_DIR .. "/space_layouts_" .. i .. "." .. ext) do
+  while hs.fs.attributes(obj.dataDir .. "/space_layouts_" .. i .. "." .. ext) do
     i = i + 1
   end
-  return HS_DIR .. "/space_layouts_" .. i .. "." .. ext
+  return obj.dataDir .. "/space_layouts_" .. i .. "." .. ext
 end
 
 -- screens テーブルを指定パスに保存する（成功=true）
@@ -190,7 +214,7 @@ local function saveConfigFile(path, screens)
   -- { screens = {...} } としてエンコード
   local ok, encoded = pcall(hs.json.encode, { screens = screens }, true)
   if not ok then
-    hs.alert.show("space_layout: エンコード失敗: " .. tostring(encoded))
+    hs.alert.show("SpaceSaver: エンコード失敗: " .. tostring(encoded))
     return false
   end
   -- hs.json.encode は空テーブルを {} にするが、配列フィールドは [] が必要なため修正
@@ -200,9 +224,9 @@ local function saveConfigFile(path, screens)
   local yq = yqBin()
   if yq and path:match("%.yaml$") then
     -- 一時JSONに書き出して yq で YAML 変換
-    local tmp = HS_DIR .. "/.spl_tmp.json"
+    local tmp = obj.dataDir .. "/.spl_tmp.json"
     local fj = io.open(tmp, "w")
-    if not fj then hs.alert.show("space_layout: 一時ファイル書き込み失敗"); return false end
+    if not fj then hs.alert.show("SpaceSaver: 一時ファイル書き込み失敗"); return false end
     fj:write(encoded); fj:close()
 
     -- yq は {screens: ...} JSON を "screens:\n  ..." YAML に変換する
@@ -211,19 +235,19 @@ local function saveConfigFile(path, screens)
     os.remove(tmp)
 
     if not ok2 or not yaml or not yaml:match("%S") then
-      hs.alert.show("space_layout: YAML変換失敗"); return false
+      hs.alert.show("SpaceSaver: YAML変換失敗"); return false
     end
 
     -- ヘッダ (modeline / apiVersion / kind) を先頭に付与して保存
     -- yq の出力が "screens:\n ..." で始まるので、そのまま連結すると正しいYAMLになる
     local fw = io.open(path, "w")
-    if not fw then hs.alert.show("space_layout: 保存失敗 (" .. path .. ")"); return false end
-    fw:write(YAML_HEADER .. yaml)
+    if not fw then hs.alert.show("SpaceSaver: 保存失敗 (" .. path .. ")"); return false end
+    fw:write(yamlHeader() .. yaml)
     fw:close()
   else
     -- JSON フォールバック
     local f = io.open(path, "w")
-    if not f then hs.alert.show("space_layout: 保存失敗 (" .. path .. ")"); return false end
+    if not f then hs.alert.show("SpaceSaver: 保存失敗 (" .. path .. ")"); return false end
     f:write(encoded); f:close()
   end
   return true
@@ -328,7 +352,7 @@ local function spaceIsFullscreen(sid)
 end
 
 -- ============================================================
--- updateMenu の前方宣言（M.capture 内の finish() から呼ばれる）
+-- updateMenu の前方宣言（capture 内の finish() から呼ばれる）
 -- ============================================================
 
 local updateMenu
@@ -337,23 +361,23 @@ local updateMenu
 -- キャプチャ（手動）
 -- ============================================================
 
-function M.capture()
+function obj:capture()
   if busy then
-    hs.alert.show("space_layout: キャプチャ中です。しばらくお待ちください")
+    hs.alert.show("SpaceSaver: キャプチャ中です。しばらくお待ちください")
     return
   end
   busy = true
-  hs.alert.show("space_layout: キャプチャ開始…操作しないでください", 999)
+  hs.alert.show("SpaceSaver: キャプチャ開始…操作しないでください", 999)
 
   local set = currentScreenSet()
 
   -- 既存の構成ファイルを探す（あればそのパスに上書き）
   local path, existingData = findConfigFile(set)
   if path then
-    print("space_layout: 既存ファイル [" .. basename(path) .. "] を更新")
+    print("SpaceSaver: 既存ファイル [" .. basename(path) .. "] を更新")
   else
     path = nextConfigFilePath()
-    print("space_layout: 新規ファイル [" .. basename(path) .. "] を作成")
+    print("SpaceSaver: 新規ファイル [" .. basename(path) .. "] を作成")
   end
 
   -- 現在のアクティブSpaceを記録（キャプチャ後に戻すため）
@@ -401,7 +425,7 @@ function M.capture()
       end
       saveConfigFile(path, newScreens)
       busy = false
-      hs.alert.show("space_layout: キャプチャ完了 [" .. basename(path) .. "]")
+      hs.alert.show("SpaceSaver: キャプチャ完了 [" .. basename(path) .. "]")
       if updateMenu then updateMenu() end
     end)
   end
@@ -448,12 +472,12 @@ local function restoreCurrentConfig()
   local set = currentScreenSet()
   local path, data = findConfigFile(set)
   if not path or not data then
-    print("space_layout: 現在の構成に対応するファイルなし。スキップ")
+    print("SpaceSaver: 現在の構成に対応するファイルなし。スキップ")
     return
   end
 
-  print("space_layout: [" .. basename(path) .. "] を復元")
-  hs.alert.show("space_layout: [" .. basename(path) .. "] 復元中…", 3)
+  print("SpaceSaver: [" .. basename(path) .. "] を復元")
+  hs.alert.show("SpaceSaver: [" .. basename(path) .. "] 復元中…", 3)
 
   for uuid, screenData in pairs(data.screens) do
     if hs.screen.find(uuid) then
@@ -526,7 +550,7 @@ updateMenu = function()
   menubar:setMenu({
     {
       title = "レイアウトをキャプチャ",
-      fn = function() M.capture() end,
+      fn = function() obj:capture() end,
     },
     { title = "-" },
     {
@@ -550,12 +574,12 @@ updateMenu = function()
         if path then
           hs.execute("open " .. sq(path))
         else
-          hs.alert.show("space_layout: 現在の構成のファイルがありません。まずキャプチャしてください")
+          hs.alert.show("SpaceSaver: 現在の構成のファイルがありません。まずキャプチャしてください")
         end
       end,
     },
     { title = "-" },
-    { title = "デバッグ: dump", fn = function() M.dump() end },
+    { title = "デバッグ: dump", fn = function() obj:dump() end },
   })
 end
 
@@ -576,14 +600,38 @@ end
 -- 公開 API
 -- ============================================================
 
-function M.start()
+-- hs.loadSpoon() から自動で呼ばれる。
+-- watcher/menubar は :start() で構築するためここでは何もしない。
+-- dataDir は loadSpoon 後・:start() 前にカスタマイズできる。
+function obj:init()
+end
+
+-- ホットキーを SpaceSaver の各アクションに割り当てる。
+-- mapping は次のキーを持つテーブル（いずれも任意）:
+--   capture: レイアウトをキャプチャ（hammerspoon://space-capture と同じ）
+--   restore: レイアウトを復元（hammerspoon://space-restore と同じ）
+-- 例:
+--   spoon.SpaceSaver:bindHotkeys({
+--     capture = {{"cmd","alt","ctrl"}, "c"},
+--     restore = {{"cmd","alt","ctrl"}, "r"},
+--   })
+function obj:bindHotkeys(mapping)
+  local spec = {
+    capture = hs.fnutils.partial(self.capture, self),
+    restore = hs.fnutils.partial(restoreCurrentConfig),
+  }
+  hs.spoons.bindHotkeysToSpec(spec, mapping)
+  return self
+end
+
+function obj:start()
   trackedSignature = screenSignature(currentScreenSet())
 
   -- メニューバー
   menubar = hs.menubar.new()
   if menubar then
     -- SVGアイコンをテンプレートイメージ（ライト/ダークモード自動対応）として使用
-    local icon = hs.image.imageFromPath(HS_DIR .. "/space_layout.svg")
+    local icon = hs.image.imageFromPath(hs.spoons.resourcePath("space_layout.svg"))
     if icon then
       icon:setSize({ w = 18, h = 18 })
       menubar:setIcon(icon, true)
@@ -594,7 +642,7 @@ function M.start()
   end
 
   -- URLイベント（シェルから open -g "hammerspoon://space-capture" で起動可）
-  hs.urlevent.bind("space-capture", function() M.capture() end)
+  hs.urlevent.bind("space-capture", function() obj:capture() end)
   hs.urlevent.bind("space-restore", function() restoreCurrentConfig() end)
 
   -- スクリーンウォッチャー（SCREEN_SETTLE秒のデバウンス付き）
@@ -604,27 +652,29 @@ function M.start()
   end)
   screenWatcher:start()
 
-  print("space_layout: 起動 (構成ファイル数: " .. #listConfigFiles() .. ")")
+  print("SpaceSaver: 起動 (構成ファイル数: " .. #listConfigFiles() .. ")")
+  return self
 end
 
-function M.stop()
+function obj:stop()
   if screenWatcher then screenWatcher:stop(); screenWatcher = nil end
   if screenTimer   then screenTimer:stop();   screenTimer   = nil end
   if menubar       then menubar:delete();      menubar       = nil end
   hs.urlevent.bind("space-capture", nil)
   hs.urlevent.bind("space-restore", nil)
-  print("space_layout: 停止")
+  print("SpaceSaver: 停止")
+  return self
 end
 
 -- デバッグ用: 現在の構成に一致するファイルの内容をコンソールに表示
-function M.dump()
+function obj:dump()
   local set = currentScreenSet()
   local path, data = findConfigFile(set)
   if path then
     print("File: " .. path)
     print(hs.inspect(data))
   else
-    print("space_layout: 現在の構成に対応するファイルなし")
+    print("SpaceSaver: 現在の構成に対応するファイルなし")
     local files = listConfigFiles()
     if #files > 0 then
       print("既知のファイル: " .. hs.inspect(files))
@@ -634,4 +684,4 @@ function M.dump()
   end
 end
 
-return M
+return obj
