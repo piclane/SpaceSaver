@@ -72,8 +72,9 @@ obj.dataDir  = hs.configdir
 local YQ_DEFAULT = "/opt/homebrew/bin/yq"
 
 local SCREEN_SETTLE  = 2.0   -- 秒: モニター変化後、復元開始までのデバウンス
-local RESTORE_DELAY  = 1.5   -- 秒: Space追加後、ウィンドウ移動までの待機
+local RESTORE_DELAY  = 1.5   -- 秒: Space追加/削除後、ウィンドウ移動までの待機
 local CAPTURE_SETTLE = 0.6   -- 秒: gotoSpace後、ウィンドウ取得までの待機
+local MC_STEP_DELAY  = 0.6   -- 秒: Space追加/削除(Mission Control操作)の各ステップ間の待機
 
 -- 各YAMLファイルの先頭に付与するヘッダを返す
 -- "screens:" は yq の変換出力がそのまま続くので、ここには含めない
@@ -479,60 +480,117 @@ local function restoreCurrentConfig()
   print("SpaceSaver: [" .. basename(path) .. "] を復元")
   hs.alert.show("SpaceSaver: [" .. basename(path) .. "] 復元中…", 3)
 
+  -- 対象画面ごとの計画を作る（現在接続中の画面のみ）
+  -- plan = { uuid, spaces(レイアウト配列), target(目標user数) }
+  local screenPlans = {}
   for uuid, screenData in pairs(data.screens) do
     if hs.screen.find(uuid) then
-      -- metadata は使わない。spaces のみ参照
       local spaces = screenData.spaces or {}
-
-      -- user Space の数を数える
       local userCount = 0
       for _, sp in ipairs(spaces) do
         if (sp.type or "user") ~= "fullscreen" then userCount = userCount + 1 end
       end
+      table.insert(screenPlans, { uuid = uuid, spaces = spaces, target = userCount })
+    end
+  end
 
-      -- 不足分の user Space を追加
-      local existing = hs.spaces.spacesForScreen(uuid) or {}
-      local needed = userCount - #existing
-      for _ = 1, math.max(0, needed) do
-        pcall(hs.spaces.addSpaceToScreen, uuid, false)
+  -- 各画面の user Space 数を目標に合わせる Mission Control 操作キューを構築する。
+  -- spacesForScreen は user/fullscreen 両方を返すため、user のみを対象に増減する。
+  --   add    : user Space を1つ追加
+  --   goto   : 削除前に先頭 user Space へ移動（アクティブSpaceは削除できないため）
+  --   remove : 末尾の余剰 user Space を1つ削除
+  local ops = {}
+  for _, plan in ipairs(screenPlans) do
+    local userSpaceIDs = {}
+    for _, sid in ipairs(hs.spaces.spacesForScreen(plan.uuid) or {}) do
+      if not spaceIsFullscreen(sid) then table.insert(userSpaceIDs, sid) end
+    end
+    local diff = plan.target - #userSpaceIDs
+    if diff > 0 then
+      -- 不足分を追加
+      for _ = 1, diff do
+        table.insert(ops, { kind = "add", uuid = plan.uuid })
       end
-      if needed > 0 then pcall(hs.spaces.closeMissionControl) end
+    elseif diff < 0 then
+      -- 余剰分を末尾から削除（macOS制約で最低1個のuser Spaceは残す）
+      local removable = math.max(0, #userSpaceIDs - 1)
+      local toRemove = math.min(-diff, removable)
+      if toRemove > 0 then
+        -- 先頭 user Space をアクティブにしてから末尾を削除する
+        table.insert(ops, { kind = "goto", sid = userSpaceIDs[1] })
+        for k = 0, toRemove - 1 do
+          table.insert(ops, { kind = "remove", sid = userSpaceIDs[#userSpaceIDs - k] })
+        end
+      end
+    end
+  end
 
-      hs.timer.doAfter(RESTORE_DELAY, function()
-        local spaceIDs = hs.spaces.spacesForScreen(uuid) or {}
-        local pool = hs.window.allWindows()
-        local userIdx = 0
+  -- Space数調整の完了後に、各画面のウィンドウを配置する
+  local function placeWindows()
+    for _, plan in ipairs(screenPlans) do
+      -- user Space のみを並び順どおりに抽出（fullscreen を除外）。
+      -- レイアウトの user Space 配列は、この userSpaceIDs に順番で対応する。
+      local userSpaceIDs = {}
+      for _, sid in ipairs(hs.spaces.spacesForScreen(plan.uuid) or {}) do
+        if not spaceIsFullscreen(sid) then table.insert(userSpaceIDs, sid) end
+      end
+      local pool = hs.window.allWindows()
+      local userIdx = 0
 
-        for _, sp in ipairs(spaces) do
-          if (sp.type or "user") == "fullscreen" then
-            -- フルスクリーンSpace: 対応ウィンドウを setFullScreen(true) で全画面化
+      for _, sp in ipairs(plan.spaces) do
+        if (sp.type or "user") == "fullscreen" then
+          -- フルスクリーンSpace: 対応ウィンドウを setFullScreen(true) で全画面化
+          for _, desc in ipairs(sp.windows or {}) do
+            local win = takeMatchingWindow(desc, pool)
+            if win then pcall(function() win:setFullScreen(true) end) end
+          end
+        else
+          -- user Space: 配列順に spaceID と対応付けてウィンドウを移動・リサイズ
+          userIdx = userIdx + 1
+          local sid = userSpaceIDs[userIdx]
+          if sid then
             for _, desc in ipairs(sp.windows or {}) do
               local win = takeMatchingWindow(desc, pool)
-              if win then pcall(function() win:setFullScreen(true) end) end
-            end
-          else
-            -- user Space: 配列順に spaceID と対応付けてウィンドウを移動・リサイズ
-            userIdx = userIdx + 1
-            local sid = spaceIDs[userIdx]
-            if sid then
-              for _, desc in ipairs(sp.windows or {}) do
-                local win = takeMatchingWindow(desc, pool)
-                if win then
-                  pcall(function()
-                    hs.spaces.moveWindowToSpace(win, sid, true)
-                    if desc.frame then
-                      win:setFrame(hs.geometry.rect(
-                        desc.frame.x, desc.frame.y,
-                        desc.frame.w, desc.frame.h))
-                    end
-                  end)
-                end
+              if win then
+                pcall(function()
+                  hs.spaces.moveWindowToSpace(win, sid, true)
+                  if desc.frame then
+                    win:setFrame(hs.geometry.rect(
+                      desc.frame.x, desc.frame.y,
+                      desc.frame.w, desc.frame.h))
+                  end
+                end)
               end
             end
           end
         end
-      end)
+      end
     end
+  end
+
+  -- 操作キューを1つずつ非同期で実行（Mission Control の競合を避けるため逐次・遅延つき）
+  local function runOps(i)
+    if i > #ops then
+      pcall(hs.spaces.closeMissionControl)
+      hs.timer.doAfter(RESTORE_DELAY, placeWindows)
+      return
+    end
+    local op = ops[i]
+    if op.kind == "add" then
+      pcall(hs.spaces.addSpaceToScreen, op.uuid, false)
+    elseif op.kind == "goto" then
+      pcall(hs.spaces.gotoSpace, op.sid)
+    elseif op.kind == "remove" then
+      pcall(hs.spaces.removeSpace, op.sid, false)
+    end
+    hs.timer.doAfter(MC_STEP_DELAY, function() runOps(i + 1) end)
+  end
+
+  if #ops == 0 then
+    -- 既に数が合っている場合は調整不要。すぐ配置する
+    placeWindows()
+  else
+    runOps(1)
   end
 end
 
