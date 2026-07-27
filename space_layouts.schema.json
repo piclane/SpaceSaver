@@ -15,6 +15,11 @@
       "const": "SpaceLayouts",
       "description": "リソース種別"
     },
+    "ignore": {
+      "type": "array",
+      "description": "キャプチャ時に記録せず、復元時のウィンドウ候補からも除外する規則。書かれたフィールドすべてに一致したウィンドウが対象になる。",
+      "items": { "$ref": "#/$defs/ignoreRule" }
+    },
     "screens": {
       "type": "object",
       "description": "この構成に含まれる物理モニタ。キーはモニタのUUID（hs.screen:getUUID()）。このUUID集合がモニタ構成の識別子になる。",
@@ -26,6 +31,34 @@
     }
   },
   "$defs": {
+    "ignoreRule": {
+      "type": "object",
+      "description": "無視するウィンドウの条件。bundleID / title / titlePattern のうち書いたものすべてに一致したときだけ無視する（AND）。最低1つは必須。",
+      "additionalProperties": false,
+      "anyOf": [
+        { "required": ["bundleID"] },
+        { "required": ["title"] },
+        { "required": ["titlePattern"] }
+      ],
+      "properties": {
+        "bundleID": {
+          "type": "string",
+          "description": "アプリのbundleID。省略すると全アプリが対象。これだけを書くとそのアプリの全ウィンドウを無視する。"
+        },
+        "title": {
+          "type": "string",
+          "description": "ウィンドウタイトルの完全一致文字列。titlePatternがあればそちらが優先される。"
+        },
+        "titlePattern": {
+          "type": "string",
+          "description": "ウィンドウタイトルのLuaパターン。titleより優先される。"
+        },
+        "note": {
+          "type": "string",
+          "description": "無視する理由のメモ。動作には影響しない。"
+        }
+      }
+    },
     "screen": {
       "type": "object",
       "additionalProperties": false,
@@ -93,6 +126,10 @@
         "frame": {
           "$ref": "#/$defs/frame",
           "description": "ウィンドウの位置とサイズ（復元に使用）。キャプチャ時に自動入力。"
+        },
+        "note": {
+          "type": "string",
+          "description": "メモ。動作には影響せず、再キャプチャしても保持される。"
         }
       }
     },

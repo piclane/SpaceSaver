@@ -51,6 +51,9 @@
     - 余剰Spaceは削除しない（不足分追加のみ）
     - キャプチャ中はMission Controlが各Spaceぶん切り替わる
     - 再キャプチャでscreen.metadata.name/frameは実情報で上書き（ユーザーが追加した他キーは温存）
+    - 再キャプチャは既存エントリを引き継ぐ。title/titlePattern が一致するウィンドウは
+      そのエントリのまま現在のSpaceへ移し、frameだけ更新する。
+      一致しなかった既存エントリは元の位置に残る（ignoreに一致するものは削除）
     - yq不在時はJSONフォールバック（space_layouts_<n>.json）で動作
     - Spaceをまたぐ移動が必要なウィンドウはドラッグ方式で移動するため、
       その間だけマウスカーソルが動き、Spaceが切り替わる
@@ -254,9 +257,13 @@ local function nextConfigFilePath()
 end
 
 -- screens テーブルを指定パスに保存する（成功=true）
-local function saveConfigFile(path, screens)
-  -- { screens = {...} } としてエンコード
-  local ok, encoded = pcall(hs.json.encode, { screens = screens }, true)
+-- ignoreRules は既存ファイルから引き継いだ無視リスト（空なら書き出さない）
+local function saveConfigFile(path, screens, ignoreRules)
+  local payload = { screens = screens }
+  if type(ignoreRules) == "table" and #ignoreRules > 0 then
+    payload.ignore = ignoreRules
+  end
+  local ok, encoded = pcall(hs.json.encode, payload, true)
   if not ok then
     hs.alert.show("SpaceSaver: エンコード失敗: " .. tostring(encoded))
     return false
@@ -396,6 +403,58 @@ local function descKeyLabel(desc)
   return string.format("%s=[%s] bundleID=[%s]", key, val, desc.bundleID or "")
 end
 
+-- ============================================================
+-- 無視リスト（トップレベル ignore）
+-- ============================================================
+
+-- ignore 規則1件との照合。書かれたフィールドすべてに一致したときだけ真。
+-- bundleID だけを書いた規則は、そのアプリの全ウィンドウに一致する。
+local function ignoreRuleMatches(rule, bundleID, title)
+  if rule.bundleID and rule.bundleID ~= bundleID then return false end
+  if rule.titlePattern or rule.title then
+    return titleMatches(rule, title or "")
+  end
+  return rule.bundleID ~= nil
+end
+
+-- ignore のいずれかに一致するか
+local function isIgnored(rules, bundleID, title)
+  for _, rule in ipairs(rules or {}) do
+    if ignoreRuleMatches(rule, bundleID, title) then return true end
+  end
+  return false
+end
+
+-- ============================================================
+-- 既存レイアウトの再利用（再キャプチャ時のマージ）
+-- ============================================================
+
+-- 既存レイアウトの window エントリを、由来（画面 UUID と Space インデックス）つきで集める
+local function collectExistingEntries(data)
+  local entries = {}
+  if not data or type(data.screens) ~= "table" then return entries end
+  for uuid, screenData in pairs(data.screens) do
+    for spaceIdx, sp in ipairs(screenData.spaces or {}) do
+      for _, desc in ipairs(sp.windows or {}) do
+        table.insert(entries, { desc = desc, uuid = uuid, spaceIdx = spaceIdx })
+      end
+    end
+  end
+  return entries
+end
+
+-- 実ウィンドウ actual に一致する既存エントリを取り出す。
+-- 復元時と違い bundleID だけのフォールバックは使わない。
+-- 使うと titlePattern が無関係なウィンドウに吸い付き、誤った紐づけのまま保存されてしまう。
+local function takeExistingEntry(actual, entries)
+  for i, e in ipairs(entries) do
+    if e.desc.bundleID == actual.bundleID and titleMatches(e.desc, actual.title) then
+      return table.remove(entries, i)
+    end
+  end
+  return nil
+end
+
 -- spaceID がフルスクリーン型かどうか
 local function spaceIsFullscreen(sid)
   local ok, t = pcall(hs.spaces.spaceType, sid)
@@ -421,7 +480,7 @@ local function ensureWindowFilter()
 end
 
 -- win から { win=..., desc=... } のプールエントリを作る（対象外なら nil）
-local function poolEntry(win)
+local function poolEntry(win, ignoreRules)
   -- hs.window.allWindows() に倣い、Finder のデスクトップ (AXScrollArea) のような
   -- ウィンドウでないものを除く。role を読めなかったときは除外しない。
   -- 除外すると、非可視 Space のウィンドウを取りこぼして配置対象から漏らす恐れがある
@@ -435,14 +494,19 @@ local function poolEntry(win)
 
   local desc = windowDescriptor(win)
   if not desc then return nil end
+
+  -- 無視対象はプールに載せない。載せると bundleID だけのフォールバック照合で
+  -- 別のエントリに割り当てられ、意図しない位置へ動かされる
+  if isIgnored(ignoreRules, desc.bundleID, desc.title) then return nil end
+
   return { win = win, desc = desc }
 end
 
 -- Space を切り替えずにウィンドウプールを構築する
-local function buildPool()
+local function buildPool(ignoreRules)
   local pool = {}
   for _, win in ipairs(ensureWindowFilter():getWindows()) do
-    local entry = poolEntry(win)
+    local entry = poolEntry(win, ignoreRules)
     if entry then table.insert(pool, entry) end
   end
   return pool
@@ -459,7 +523,10 @@ local function unmatchedDescriptors(pool, data)
     if hs.screen.find(uuid) then
       for _, sp in ipairs(screenData.spaces or {}) do
         for _, desc in ipairs(sp.windows or {}) do
-          if not takeMatchingWindow(desc, rest) then
+          -- ignore に一致する記述は意図的に配置しないので、取りこぼしとして数えない
+          -- （次のキャプチャで削除される）
+          if not isIgnored(data.ignore, desc.bundleID, desc.title)
+             and not takeMatchingWindow(desc, rest) then
             table.insert(missing, desc)
           end
         end
@@ -511,6 +578,11 @@ function obj:capture()
     print("SpaceSaver: 新規ファイル [" .. basename(path) .. "] を作成")
   end
 
+  -- 無視リストと、既存エントリの再利用プールを用意する。
+  -- leftover は実ウィンドウと照合するたびに消費され、残ったものは finish() で元の位置に戻す。
+  local ignoreRules = existingData and existingData.ignore or nil
+  local leftover    = collectExistingEntries(existingData)
+
   -- 現在のアクティブSpaceを記録（キャプチャ後に戻すため）
   local originalActive = {}
   for uuid in pairs(set) do
@@ -554,7 +626,30 @@ function obj:capture()
           and existingData.screens[uuid].metadata
         newScreens[uuid].metadata = screenMetadata(uuid, prevMeta)
       end
-      saveConfigFile(path, newScreens)
+
+      -- どのウィンドウにも一致しなかった既存エントリを元の位置に戻す。
+      -- アプリを閉じたままキャプチャしても手書き設定が消えないようにするため。
+      -- 実在するウィンドウの後ろに置き、復元時の照合で実在分が先に選ばれるようにする。
+      -- ignore に一致するものは戻さない。これが不要になったエントリを掃除する手段になる。
+      local kept, dropped = 0, 0
+      for _, e in ipairs(leftover) do
+        local spaces = newScreens[e.uuid] and newScreens[e.uuid].spaces
+        if isIgnored(ignoreRules, e.desc.bundleID, e.desc.title) then
+          dropped = dropped + 1
+        elseif spaces and #spaces > 0 then
+          -- 元の Space が無くなっていればその画面の末尾の Space に寄せる
+          table.insert(spaces[math.min(e.spaceIdx, #spaces)].windows, e.desc)
+          kept = kept + 1
+        else
+          dropped = dropped + 1
+        end
+      end
+      if kept > 0 or dropped > 0 then
+        print(string.format(
+          "SpaceSaver: 該当ウィンドウのない既存エントリ 保持=%d 削除=%d", kept, dropped))
+      end
+
+      saveConfigFile(path, newScreens, ignoreRules)
       busy = false
       hs.alert.show("SpaceSaver: キャプチャ完了 [" .. basename(path) .. "]")
       if updateMenu then updateMenu() end
@@ -578,7 +673,17 @@ function obj:capture()
             pcall(function() isStd = win:isStandard() end)
             if isStd then
               local desc = windowDescriptor(win)
-              if desc then table.insert(windows, desc) end
+              if desc and not isIgnored(ignoreRules, desc.bundleID, desc.title) then
+                -- 既存エントリに一致するなら、それを再利用して frame だけ実測値に更新する。
+                -- 手書きした titlePattern や note を再キャプチャで失わないため。
+                local prev = takeExistingEntry(desc, leftover)
+                if prev then
+                  prev.desc.frame = desc.frame
+                  table.insert(windows, prev.desc)
+                else
+                  table.insert(windows, desc)
+                end
+              end
             end
           end
         end
@@ -817,7 +922,7 @@ local function restoreCurrentConfig()
             if not seen[wid] then
               seen[wid] = true
               local win = hs.window.get(wid)
-              local entry = win and poolEntry(win)
+              local entry = win and poolEntry(win, data.ignore)
               if entry then table.insert(pool, entry) end
             end
           end
@@ -833,7 +938,7 @@ local function restoreCurrentConfig()
   -- アプリが起動中なのに照合できなかった記述は、ウィンドウ列挙の取りこぼしか
   -- レイアウトの記述ずれのどちらかなので、判断材料としてログに出す。
   local function buildPoolAndPlace()
-    local pool     = buildPool()
+    local pool     = buildPool(data.ignore)
     local unmet    = missingButRunning(unmatchedDescriptors(pool, data))
 
     if #unmet > 0 then

@@ -247,6 +247,7 @@ spoon.SpaceSaver:start()
 # yaml-language-server: $schema=/Users/you/.hammerspoon/Spoons/SpaceSaver.spoon/space_layouts.schema.json
 apiVersion: v1          # 固定値
 kind: SpaceLayouts      # 固定値
+ignore: [...]           # 記録も復元もしないウィンドウの規則（任意）
 screens:                # モニタ UUID → screen オブジェクト のマップ
   "<UUID>":
     metadata: ...
@@ -257,9 +258,39 @@ screens:                # モニタ UUID → screen オブジェクト のマッ
 |---|---|---|
 | `apiVersion` | `"v1"` | 固定。将来のバージョン互換のために保持。 |
 | `kind` | `"SpaceLayouts"` | 固定。 |
+| `ignore` | array | キャプチャ時に記録せず、復元時のウィンドウ候補からも除外する規則。省略可。 |
 | `screens` | object | キーがモニタの UUID（`hs.screen:getUUID()`）。この UUID の集合がモニタ構成の識別子になる。 |
 
 > **ファイルの選択ロジック**：データディレクトリ（デフォルト `~/.hammerspoon/`）の `space_layouts_*.yaml` を順に読み込み、`screens` のキー集合が現在接続中のモニタ UUID 集合と一致するファイルが選ばれます。ファイル名は単なるラベルであり、照合には使用しません。
+
+---
+
+### `ignore[]`（無視するウィンドウ）
+
+記録も復元もしたくないウィンドウを宣言します。デベロッパーツールのように毎回位置が変わるウィンドウや、常駐アプリのオーバーレイを締め出すのに使います。
+
+```yaml
+ignore:
+  - bundleID: "com.google.Chrome"
+    titlePattern: "^DevTools"
+    note: "毎回位置が変わるので記録しない"
+  - bundleID: "pro.betterdisplay.BetterDisplay"   # title 系を省略 = そのアプリの全ウィンドウ
+  - titlePattern: "^Picture in Picture$"          # bundleID を省略 = 全アプリ横断
+```
+
+| フィールド | 型 | 必須 | 説明 |
+|---|---|---|---|
+| `bundleID` | string | — | アプリの Bundle ID。省略すると全アプリが対象。 |
+| `title` | string | — | ウィンドウタイトルの完全一致。 |
+| `titlePattern` | string | — | ウィンドウタイトルの Lua パターン。`title` より優先。 |
+| `note` | string | — | 無視する理由のメモ。動作には影響しない。 |
+
+`bundleID` / `title` / `titlePattern` のうち**書いたものすべてに一致**したウィンドウが無視されます（AND）。最低 1 つは必須です。
+
+**効果は 2 つあります**：
+
+1. **キャプチャ時**：そのウィンドウを記録しません。既にレイアウトに書かれているエントリも、`ignore` に一致すれば再キャプチャで削除されます。不要になったエントリを掃除する手段になります。
+2. **復元時**：ウィンドウ候補から除外します。除外しないと、`bundleID` だけのフォールバック照合で無視したはずのウィンドウが別のエントリに割り当てられ、意図しない位置へ動かされます。
 
 ---
 
@@ -319,6 +350,7 @@ windows:
 | `title` | string | — | キャプチャ時のウィンドウタイトル（完全一致）。`titlePattern` がある場合は参照用のみ。 |
 | `titlePattern` | string | — | Lua パターンによるウィンドウタイトル照合。`title` より優先される。タイトルが変わるアプリ（ブラウザ・ターミナル等）で有用。 |
 | `frame` | frame | — | ウィンドウの位置とサイズ。省略すると復元時にリサイズしない。 |
+| `note` | string | — | メモ。動作には影響せず、再キャプチャしても保持される。 |
 
 **ウィンドウ照合のルール**：
 
@@ -416,6 +448,8 @@ screens:
 - ウィンドウの照合は `bundleID + タイトル`（または `titlePattern`）のベストエフォートです。タイトルが完全に一意でないアプリでは意図しないウィンドウと照合されることがあります。
 - 復元時に余剰な Space は削除しません（不足分の追加のみ）。不要な Space は手動で削除してください。
 - フルスクリーン Space の並び順は復元できません（ベストエフォート）。
+- 再キャプチャは既存のエントリを引き継ぎます。`bundleID` と `title`／`titlePattern` が一致するウィンドウは、そのエントリのまま**現在いる Space** へ移され、`frame` だけ実測値に更新されます。手書きした `titlePattern` や `note` は失われません。どのウィンドウにも一致しなかったエントリ（アプリ未起動など）は元の位置に残るので、不要になったら手で削除するか `ignore` に書いてください。
+  - キャプチャでは `bundleID` だけのフォールバック照合を使いません。使うと `titlePattern` が無関係なウィンドウに吸い付き、誤った紐づけのまま保存されるためです。
 - 再キャプチャすると `screens.<UUID>.metadata.name` と `metadata.frame` は実モニタ情報で上書きされます。ユーザーが追加した他のメタデータキーは保持されます。
 - 復元では Space を巡回しません。非可視 Space のウィンドウは `hs.window.filter` から取得します。ただし Hammerspoon をリロードした直後はこのキャッシュが揃っておらず、同一アプリの 2 枚目以降のウィンドウを取りこぼすことがあります。確実さを優先する場合は `spoon.SpaceSaver.rescanSpacesIfIncomplete = true` を設定すると、照合できない記述があったときだけ全 Space を巡回します（そのぶん時間がかかります）。
 - Space をまたぐ移動が必要なウィンドウがある場合のみ、その間だけマウスカーソルが動き Space が切り替わります（→ [Space をまたぐウィンドウ移動](#space-をまたぐウィンドウ移動)）。
