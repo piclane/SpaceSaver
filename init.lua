@@ -47,7 +47,9 @@
 
   既知の制限:
     - Luaパターン照合（完全なPCREではない）
-    - フルスクリーンSpaceの並び順は厳密復元不可
+    - フルスクリーンSpaceの並び順も復元する。新しいフルスクリーンSpaceは
+      必ず画面の末尾に作られるため、Mission Controlでサムネイルをドラッグして直す
+      （restoreFullscreenSpaceOrder=false で無効化できる）
     - フルスクリーンのウィンドウは記録されたモニタで全画面化する。
       別モニタで全画面だった場合は解除→移動→全画面化で入れ直す（数秒かかる）
     - 復元はSpace数をYAMLに合わせる（不足なら追加、余剰なら末尾から削除）。
@@ -96,8 +98,15 @@ obj.spaceSwitchHotkeys = nil
 -- そこまで確実に復元したい場合のみ true にする。
 obj.rescanSpacesIfIncomplete = false
 
+-- フルスクリーン Space をレイアウトどおりの位置へ並べ替えるか。
+-- Mission Control を開いてサムネイルをドラッグするため、
+-- 並びがずれているときだけ動くとはいえ数秒かかり画面上でも目立つ。
+obj.restoreFullscreenSpaceOrder = true
+
 -- Space 移動モジュール（space_move.lua）を読み込む
-local spaceMove = dofile(hs.spoons.resourcePath("space_move.lua"))
+local spaceMove  = dofile(hs.spoons.resourcePath("space_move.lua"))
+-- Space 並び替えモジュール（space_order.lua）を読み込む
+local spaceOrder = dofile(hs.spoons.resourcePath("space_order.lua"))
 
 -- ============================================================
 -- 設定定数
@@ -809,6 +818,8 @@ local function restoreCurrentConfig()
   local function placeWindows(pool)
     -- ① タスクリスト構築（pool.takeMatchingWindow の消費順を現状と同一に保つ）
     local tasks = {}
+    -- 並べ替えのため、レイアウト上の何番目の Space に全画面化したかを控える
+    local fsPlacements = {}
     for _, plan in ipairs(screenPlans) do
       -- user Space のみを並び順どおりに抽出（fullscreen を除外）。
       -- レイアウトの user Space 配列は、この userSpaceIDs に順番で対応する。
@@ -818,7 +829,7 @@ local function restoreCurrentConfig()
       end
       local userIdx = 0
 
-      for _, sp in ipairs(plan.spaces) do
+      for spIdx, sp in ipairs(plan.spaces) do
         if (sp.type or "user") == "fullscreen" then
           -- フルスクリーンSpace: setFullScreen(true) タスク
           for _, desc in ipairs(sp.windows or {}) do
@@ -828,7 +839,7 @@ local function restoreCurrentConfig()
                 kind = "fullscreen",
                 win = entry.win, desc = desc,
                 actualTitle = entry.desc.title, matchKind = matchKind,
-                uuid = plan.uuid,
+                uuid = plan.uuid, spaceIdx = spIdx,
               })
             else
               print(string.format("未配置 %s actualTitle=[] reason=[該当ウィンドウなし]",
@@ -865,13 +876,52 @@ local function restoreCurrentConfig()
       end
     end
 
+    -- 全画面化したウィンドウの Space を、レイアウトが指す位置へ並べ替える。
+    -- フルスクリーン Space は必ず末尾に作られるため、作っただけでは順番が合わない。
+    local function arrangeFullscreenOrder()
+      if not obj.restoreFullscreenSpaceOrder or #fsPlacements == 0 then
+        finish(); return
+      end
+
+      -- 画面ごとに { sid, index } を集め、index の昇順に並べる
+      local byScreen = {}
+      for _, p in ipairs(fsPlacements) do
+        local spaces = hs.spaces.windowSpaces(p.win) or {}
+        local sid = spaces[1]
+        if sid and spaceIsFullscreen(sid) then
+          byScreen[p.uuid] = byScreen[p.uuid] or {}
+          table.insert(byScreen[p.uuid], { sid = sid, index = p.index })
+        end
+      end
+
+      local work = {}
+      for uuid, targets in pairs(byScreen) do
+        table.sort(targets, function(a, b) return a.index < b.index end)
+        table.insert(work, { uuid = uuid, targets = targets })
+      end
+
+      local function step(i)
+        if i > #work then finish(); return end
+        spaceOrder.arrange(work[i].uuid, work[i].targets, function(moved)
+          if moved > 0 then
+            spacesTouched = true
+            print(string.format("SpaceSaver: screen=[%s] のフルスクリーン Space を %d 件並べ替え",
+              work[i].uuid, moved))
+          end
+          step(i + 1)
+        end)
+      end
+      step(1)
+    end
+
     -- ② タスクを逐次・非同期で実行（ドラッグ方式に落ちる場合があるので1件ずつ待つ）
     local function runTask(i)
-      if i > #tasks then finish(); return end
+      if i > #tasks then arrangeFullscreenOrder(); return end
       local t = tasks[i]
       if t.kind == "fullscreen" then
         spaceMove.makeFullScreen(t.win, t.uuid, t.desc.frame, function(method)
           if method ~= "none" then spacesTouched = true end
+          table.insert(fsPlacements, { uuid = t.uuid, index = t.spaceIdx, win = t.win })
           local note = t.matchKind == "bundle" and " (bundleIDのみ一致)" or ""
           print(string.format("配置 %s actualTitle=[%s] -> screen=[%s] fullscreen=[%s]%s",
             descKeyLabel(t.desc), t.actualTitle, t.uuid, method, note))
