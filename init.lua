@@ -48,6 +48,8 @@
   既知の制限:
     - Luaパターン照合（完全なPCREではない）
     - フルスクリーンSpaceの並び順は厳密復元不可
+    - フルスクリーンのウィンドウは記録されたモニタで全画面化する。
+      別モニタで全画面だった場合は解除→移動→全画面化で入れ直す（数秒かかる）
     - 復元はSpace数をYAMLに合わせる（不足なら追加、余剰なら末尾から削除）。
       ただしmacOSの制約で1画面につきuser Spaceは最低1つ残る
     - キャプチャ中はMission Controlが各Spaceぶん切り替わる
@@ -868,15 +870,13 @@ local function restoreCurrentConfig()
       if i > #tasks then finish(); return end
       local t = tasks[i]
       if t.kind == "fullscreen" then
-        -- 既にフルスクリーンなら何もしない（setFullScreen は Space 切替を伴う）
-        local already = false
-        pcall(function() already = t.win:isFullScreen() end)
-        if not already then pcall(function() t.win:setFullScreen(true) end) end
-        local note = t.matchKind == "bundle" and " (bundleIDのみ一致)" or ""
-        print(string.format("配置 %s actualTitle=[%s] -> screen=[%s] fullscreen%s%s",
-          descKeyLabel(t.desc), t.actualTitle, t.uuid,
-          already and " (変更なし)" or "", note))
-        runTask(i + 1)
+        spaceMove.makeFullScreen(t.win, t.uuid, t.desc.frame, function(method)
+          if method ~= "none" then spacesTouched = true end
+          local note = t.matchKind == "bundle" and " (bundleIDのみ一致)" or ""
+          print(string.format("配置 %s actualTitle=[%s] -> screen=[%s] fullscreen=[%s]%s",
+            descKeyLabel(t.desc), t.actualTitle, t.uuid, method, note))
+          runTask(i + 1)
+        end)
       elseif t.kind == "space" then
         spaceMove.moveWindowToSpace(t.win, t.sid, t.desc.frame, obj.spaceSwitchHotkeys,
           function(method)

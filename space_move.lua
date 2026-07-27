@@ -16,6 +16,15 @@
   参考: https://gist.github.com/xgungnir/a02f059b29adacaf7df884920e127533
 
   公開インターフェース:
+    M.makeFullScreen(win, screenUUID, frame, done)
+      win        : hs.window
+      screenUUID : フルスクリーンにする対象モニタの UUID
+      frame      : {x,y,w,h} 目的モニタへ寄せるための矩形（nil なら実モニタの矩形）
+      done       : 完了コールバック。常に1回だけ、結果を引数に呼ばれる
+                   "none"     既に目的モニタでフルスクリーンだった
+                   "enter"    同じモニタ上でフルスクリーン化した
+                   "rescreen" 別モニタから移して入れ直した
+
     M.moveWindowToSpace(win, sid, frame, hotkeys, done)
       win     : hs.window
       sid     : 目的 Space ID
@@ -45,6 +54,11 @@ local KEY_HOLD     = 0.03  -- keyDown から keyUp まで（秒）
 local DROP_DELAY   = 0.1   -- mouseUp 後、フレーム復元まで（秒）
 local VERIFY_DELAY = 0.2   -- 純正 API 実行後、windowSpaces を検算するまで（秒）
 local TIMEOUT_BASE = 3.0   -- 安全タイムアウトの固定分（秒）。可変分は Space 移動段数に比例
+
+-- フルスクリーン切替はアニメーションを伴うため、各段で収まるのを待つ
+local FS_EXIT_DELAY  = 1.2  -- フルスクリーン解除後（秒）
+local FS_FRAME_DELAY = 0.4  -- 目的モニタへ寄せた後（秒）
+local FS_ENTER_DELAY = 1.2  -- フルスクリーン化後（秒）
 
 -- ============================================================
 -- 修飾キー / ショートカット設定
@@ -132,6 +146,27 @@ local function applyFrame(win, frame)
   pcall(function()
     win:setFrame(hs.geometry.rect(frame.x, frame.y, frame.w, frame.h))
   end)
+end
+
+-- win が今いるスクリーンの UUID を返す（判定できなければ nil）。
+-- フルスクリーンのウィンドウでも所属 Space から辿れる
+local function screenUUIDOf(win)
+  local spaces = windowSpacesOf(win)
+  if spaces[1] then
+    local ok, uuid = pcall(hs.spaces.spaceDisplay, spaces[1])
+    if ok and uuid then return uuid end
+  end
+  local ok, scr = pcall(function() return win:screen() end)
+  if ok and scr then return scr:getUUID() end
+  return nil
+end
+
+-- スクリーン UUID の矩形を frame 形式で返す（見つからなければ nil）
+local function screenFrameOf(uuid)
+  local scr = hs.screen.find(uuid)
+  if not scr then return nil end
+  local f = scr:frame()
+  return { x = f.x, y = f.y, w = f.w, h = f.h }
 end
 
 -- ============================================================
@@ -372,6 +407,51 @@ end
 -- ============================================================
 -- 公開 API
 -- ============================================================
+
+--- win を screenUUID のモニタでフルスクリーンにする。
+--- setFullScreen(true) は「ウィンドウが今いるモニタ」で全画面化するため、
+--- 目的のモニタに居ないときは一度解除して寄せ直す必要がある。
+--- done(method) は常に1回だけ呼ばれる。
+---   "none"     既に目的モニタでフルスクリーンだったので何もしない
+---   "enter"    同じモニタ上でフルスクリーン化した
+---   "rescreen" 別モニタのフルスクリーンを解除し、目的モニタで入れ直した
+function M.makeFullScreen(win, screenUUID, frame, done)
+  local isFS = false
+  pcall(function() isFS = win:isFullScreen() end)
+  local onTarget = (screenUUIDOf(win) == screenUUID)
+
+  -- 目的モニタで既にフルスクリーンなら触らない。
+  -- フルスクリーン切替は Space の切替とアニメーションを伴うため、不要なら避ける
+  if isFS and onTarget then
+    later(0, function() done("none") end)
+    return
+  end
+
+  local function enter(method)
+    pcall(function() win:setFullScreen(true) end)
+    later(FS_ENTER_DELAY, function() done(method) end)
+  end
+
+  if onTarget then
+    enter("enter")
+    return
+  end
+
+  -- 目的モニタへ寄せてから全画面化する。
+  -- レイアウトの frame が無い場合はモニタの矩形で代用する
+  local function relocateAndEnter()
+    applyFrame(win, frame or screenFrameOf(screenUUID))
+    later(FS_FRAME_DELAY, function() enter(isFS and "rescreen" or "enter") end)
+  end
+
+  if isFS then
+    -- フルスクリーン中は setFrame でモニタを移せないので、いったん解除する
+    pcall(function() win:setFullScreen(false) end)
+    later(FS_EXIT_DELAY, relocateAndEnter)
+  else
+    relocateAndEnter()
+  end
+end
 
 --- win を targetSid の Space へ移動し、frame を適用する。
 --- done(method) は常に1回だけ呼ばれる。
