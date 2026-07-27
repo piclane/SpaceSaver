@@ -422,11 +422,12 @@ end
 
 -- win から { win=..., desc=... } のプールエントリを作る（対象外なら nil）
 local function poolEntry(win)
-  -- Finder のデスクトップは AXScrollArea だが isStandard() が真になる。
-  -- hs.window.allWindows() と同じく role で弾かないとレイアウトの Finder 指定を横取りする
+  -- hs.window.allWindows() に倣い、Finder のデスクトップ (AXScrollArea) のような
+  -- ウィンドウでないものを除く。role を読めなかったときは除外しない。
+  -- 除外すると、非可視 Space のウィンドウを取りこぼして配置対象から漏らす恐れがある
   local role = nil
   pcall(function() role = win:role() end)
-  if role ~= "AXWindow" then return nil end
+  if role and role ~= "AXWindow" then return nil end
 
   local isStd = false
   pcall(function() isStd = win:isStandard() end)
