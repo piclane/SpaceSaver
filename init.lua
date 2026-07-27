@@ -122,6 +122,20 @@ local menubar          = nil
 -- ユーティリティ
 -- ============================================================
 
+-- hs.timer.doAfter は戻り値を保持しないとタイマーが GC され、
+-- コールバックが呼ばれないままキャプチャ・復元が途中で止まる。発火するまで参照を持つ。
+local pendingTimers = {}
+
+local function later(delay, fn)
+  local t
+  t = hs.timer.doAfter(delay, function()
+    pendingTimers[t] = nil
+    fn()
+  end)
+  pendingTimers[t] = true
+  return t
+end
+
 -- yq バイナリのパスを返す（見つからなければnil）
 local function yqBin()
   if hs.fs.attributes(YQ_DEFAULT) then return YQ_DEFAULT end
@@ -443,7 +457,7 @@ function obj:capture()
     for uuid, sid in pairs(originalActive) do
       pcall(hs.spaces.gotoSpace, sid)
     end
-    hs.timer.doAfter(CAPTURE_SETTLE, function()
+    later(CAPTURE_SETTLE, function()
       pcall(hs.spaces.closeMissionControl)
       -- screen.metadata を更新（実モニタ情報で上書き、ユーザー追加キーは温存）
       for uuid in pairs(newScreens) do
@@ -465,7 +479,7 @@ function obj:capture()
     if i > #worklist then finish(); return end
     local item = worklist[i]
     pcall(hs.spaces.gotoSpace, item.sid)
-    hs.timer.doAfter(CAPTURE_SETTLE, function()
+    later(CAPTURE_SETTLE, function()
       local isFS = spaceIsFullscreen(item.sid)
       local windows = {}
       local wok, winIDs = pcall(hs.spaces.windowsForSpace, item.sid)
@@ -572,7 +586,7 @@ local function restoreCurrentConfig()
     for uuid, sid in pairs(originalActive) do
       pcall(hs.spaces.gotoSpace, sid)
     end
-    hs.timer.doAfter(CAPTURE_SETTLE, function()
+    later(CAPTURE_SETTLE, function()
       pcall(hs.spaces.closeMissionControl)
       busy = false
       hs.alert.closeAll()
@@ -685,7 +699,7 @@ local function restoreCurrentConfig()
     local function step(i)
       if i > #worklist then placeWindows(pool); return end
       pcall(hs.spaces.gotoSpace, worklist[i].sid)
-      hs.timer.doAfter(CAPTURE_SETTLE, function()
+      later(CAPTURE_SETTLE, function()
         local wok, winIDs = pcall(hs.spaces.windowsForSpace, worklist[i].sid)
         if wok and winIDs then
           for _, wid in ipairs(winIDs) do
@@ -713,19 +727,19 @@ local function restoreCurrentConfig()
   local function runOps(i)
     if i > #ops then
       pcall(hs.spaces.closeMissionControl)
-      hs.timer.doAfter(RESTORE_DELAY, buildPoolAndPlace)
+      later(RESTORE_DELAY, buildPoolAndPlace)
       return
     end
     local op = ops[i]
     if op.kind == "add" then
       pcall(hs.spaces.addSpaceToScreen, op.uuid, false)
-      hs.timer.doAfter(MC_STEP_DELAY, function() runOps(i + 1) end)
+      later(MC_STEP_DELAY, function() runOps(i + 1) end)
     elseif op.kind == "goto" then
       pcall(hs.spaces.gotoSpace, op.sid)
-      hs.timer.doAfter(MC_STEP_DELAY, function() runOps(i + 1) end)
+      later(MC_STEP_DELAY, function() runOps(i + 1) end)
     elseif op.kind == "remove" then
       pcall(hs.spaces.removeSpace, op.sid, false)
-      hs.timer.doAfter(MC_STEP_DELAY, function() runOps(i + 1) end)
+      later(MC_STEP_DELAY, function() runOps(i + 1) end)
     else
       runOps(i + 1)
     end
