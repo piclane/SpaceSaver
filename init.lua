@@ -48,7 +48,8 @@
   既知の制限:
     - Luaパターン照合（完全なPCREではない）
     - フルスクリーンSpaceの並び順は厳密復元不可
-    - 余剰Spaceは削除しない（不足分追加のみ）
+    - 復元はSpace数をYAMLに合わせる（不足なら追加、余剰なら末尾から削除）。
+      ただしmacOSの制約で1画面につきuser Spaceは最低1つ残る
     - キャプチャ中はMission Controlが各Spaceぶん切り替わる
     - 再キャプチャでscreen.metadata.name/frameは実情報で上書き（ユーザーが追加した他キーは温存）
     - 再キャプチャは既存エントリを引き継ぐ。title/titlePattern が一致するウィンドウは

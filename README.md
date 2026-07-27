@@ -14,10 +14,10 @@ macOS の Spaces はモニタを切り替えるたびにリセットされてし
 SpaceSaver はこの問題を次のように解決します：
 
 1. **キャプチャ**（手動・任意のタイミング）  
-   メニューバーアイコンまたはシェルコマンドで実行します。全 Space をひとつずつ自動で切り替えながら巡回し、各 Space に存在するウィンドウのアプリ情報・タイトル・位置・サイズを正確に記録します。記録結果はデータディレクトリ（デフォルト `~/.hammerspoon/`）の `space_layouts_<n>.yaml` に保存されます。**モニタ構成が異なるファイルには書き込まれないため**、自宅用・オフィス用・ノートPC単体用など複数の構成を独立して管理できます。
+   メニューバーアイコンまたはシェルコマンドで実行します。全 Space をひとつずつ自動で切り替えながら巡回し、各 Space に存在するウィンドウのアプリ情報・タイトル・位置・サイズを正確に記録します。記録結果はデータディレクトリ（デフォルト `~/.hammerspoon/`）の `space_layouts_<n>.yaml` に保存されます。**モニタ構成が異なるファイルには書き込まれないため**、自宅用・オフィス用・ノートPC単体用など複数の構成を独立して管理できます。再キャプチャしても既存のエントリは引き継がれるので、手書きした `titlePattern` は失われません。
 
 2. **復元**（自動・モニタ接続変化時）  
-   Dock の着脱やモニタの接続・切断を検出すると、接続中のモニタ UUID の集合をキーに対応する YAML ファイルを自動で選択します。Space の数が不足していれば補完し、各 Space へウィンドウを移動してウィンドウの位置・サイズも元通りに設定します。フルスクリーン（緑ボタン）で占有している Space にも対応します。キャプチャと違い**復元は Space を巡回しません**。既にあるべき Space にいるウィンドウは位置・サイズを直すだけなので、多くの場合は画面が切り替わらないまま一瞬で終わります。
+   Dock の着脱やモニタの接続・切断を検出すると、接続中のモニタ UUID の集合をキーに対応する YAML ファイルを自動で選択します。Space の数が足りなければ追加し、多すぎれば末尾から削除して YAML どおりの数に揃えたうえで、各 Space へウィンドウを移動し位置・サイズも元通りに設定します。フルスクリーン（緑ボタン）で占有している Space にも対応します。キャプチャと違い**復元は Space を巡回しません**。既にあるべき Space にいるウィンドウは位置・サイズを直すだけなので、多くの場合は画面が切り替わらないまま一瞬で終わります。
 
 3. **設定ファイルの手動調整**  
    生成された YAML は人間が読み書きしやすい形式で保存されます。ブラウザやターミナルのように実行中にウィンドウタイトルが変わるアプリには `titlePattern`（Lua パターン）を手書きで追記すれば、次の復元から自動でマッチします。`metadata` フィールドにはモニタ名や自由なメモを記録できます（復元には使用しません）。
@@ -40,6 +40,17 @@ SpaceSaver はこの問題を次のように解決します：
 
 - **可変タイトルのウィンドウに Lua パターン照合**  
   YAML に `titlePattern` を手書きすることで、タイトルが変わるアプリ（ブラウザ等）にも対応。
+
+- **再キャプチャで手書き設定を失わない**  
+  既存エントリに一致するウィンドウは、そのエントリのまま現在いる Space へ移されます。  
+  手書きした `titlePattern` や `note` は再キャプチャ後も残ります。
+
+- **無視リスト**  
+  トップレベルの `ignore` に書いたウィンドウは、キャプチャで記録されず復元の候補からも外れます。
+
+- **復元は Space を巡回しない**  
+  非可視 Space のウィンドウも `hs.window.filter` から列挙するため、  
+  移動が要らなければ画面を切り替えずに終わります。
 
 - **Kubernetes スタイルの YAML + JSON Schema**  
   `apiVersion: v1 / kind: SpaceLayouts` 形式。付属の `space_layouts.schema.json` により  
@@ -71,14 +82,14 @@ brew install yq
 
 ### 2. Spoon を配置
 
-リポジトリを `SpaceSaver.spoon` という名前で `~/.hammerspoon/Spoons/` にクローンします（`init.lua` / `space_layout.svg` / `space_layouts.schema.json` などを含みます）。
+リポジトリを `SpaceSaver.spoon` という名前で `~/.hammerspoon/Spoons/` にクローンします（`init.lua` / `space_move.lua` / `space_layout.svg` / `space_layouts.schema.json` などを含みます）。
 
 ```bash
 mkdir -p ~/.hammerspoon/Spoons
 git clone git@github.com:piclane/SpaceSaver.git ~/.hammerspoon/Spoons/SpaceSaver.spoon
 ```
 
-> エントリポイントは `init.lua` です。`space_layout.svg` と `space_layouts.schema.json` は Spoon バンドル内のリソースとして自動的に解決されます（手動コピー不要）。
+> エントリポイントは `init.lua` です。`space_move.lua` / `space_layout.svg` / `space_layouts.schema.json` は Spoon バンドル内のリソースとして自動的に解決されます（手動コピー不要）。
 
 ### 3. `~/.hammerspoon/init.lua` に追記
 
@@ -152,9 +163,28 @@ open -g "hammerspoon://space-restore"
 ### デバッグ
 
 ```lua
--- Hammerspoon コンソールで実行
+-- 現在の構成に対応するファイルの内容をコンソールに表示
 spoon.SpaceSaver:dump()
 ```
+
+復元を実行すると、YAML に書かれたウィンドウごとの結果が Hammerspoon コンソールに出力されます。
+
+```
+配置 title=[LINE] bundleID=[jp.naver.line.mac] actualTitle=[LINE] -> screen=[62CF...] userSpace#1 spaceID=[2492] move=[none]
+未配置 title=[OpenVPN Connect] bundleID=[org.openvpn.client.app] actualTitle=[] reason=[該当ウィンドウなし]
+```
+
+`move=` は Space をまたぐ移動をどう処理したかを表します。
+
+| 値 | 意味 |
+|---|---|
+| `none` | 既に目的の Space にいたので位置・サイズだけ合わせた |
+| `native` | `hs.spaces.moveWindowToSpace` で移動できた |
+| `drag` | ドラッグ方式で移動した |
+| `failed` | 移動できず、位置・サイズだけ合わせた |
+| `unsupported` | どちらの手段も無効と判明済みなので試さず、位置・サイズだけ合わせた |
+
+同じ `bundleID` の別ウィンドウで代用した場合は `(bundleIDのみ一致)` が付きます。フルスクリーン Space のエントリは `move=` ではなく `fullscreen` と表示され、既に全画面なら `(変更なし)` が付きます。
 
 ### ホットキー（任意）
 
@@ -181,6 +211,17 @@ spoon.SpaceSaver:start()
 
 > 保存先を変更した場合、既存の `space_layouts_*.yaml` は新しいディレクトリへ手動で移動してください。デフォルトのまま使う場合は移行不要です（`~/.hammerspoon/` に置かれた既存ファイルがそのまま使われます）。
 
+### 取りこぼし時の巡回（任意）
+
+復元は Space を巡回せず、非可視 Space のウィンドウも `hs.window.filter` から列挙します。ただし Hammerspoon をリロードした直後はこのキャッシュが揃っておらず、同じアプリの 2 枚目以降のウィンドウを取りこぼすことがあります。
+
+```lua
+-- 照合できない記述があったときだけ全 Space を巡回して取り直す（デフォルト false）
+spoon.SpaceSaver.rescanSpacesIfIncomplete = true
+```
+
+有効にすると確実さは上がりますが、発動したときは Space の数だけ画面が切り替わり数十秒かかります。`:start()` の前後どちらで設定しても構いません。
+
 ---
 
 ## Space をまたぐウィンドウ移動
@@ -196,7 +237,7 @@ SpaceSaver は OS バージョンでは分岐せず、**実際に移動できた
    2. ドラッグを保持したまま「操作スペースを左/右に移動」ショートカットを送出し、目的の Space まで 1 つずつ移動する
    3. マウスを放してウィンドウを正確な位置・サイズに補正する
 
-判定結果は Hammerspoon のセッション内で保持されるため、検算のコストがかかるのは最初の 1 ウィンドウだけです。
+`hs.spaces.moveWindowToSpace` が無効という判定は Hammerspoon のセッション内で保持されるため、検算の待ち時間がかかるのは最初の 1 ウィンドウだけです。2 件目以降は直接ドラッグ方式に進みます。
 
 多くの場合、復元で移動が必要なウィンドウはごく一部です。移動が不要なウィンドウしかなければ、**復元中に Space は一度も切り替わりません**。
 
@@ -217,7 +258,7 @@ spoon.SpaceSaver.spaceSwitchHotkeys = {
 spoon.SpaceSaver:start()
 ```
 
-修飾キーには `"ctrl"`, `"alt"`, `"cmd"`, `"shift"` が使えます。キー名は [Hammerspoon の `hs.keycodes.map`](https://www.hammerspoon.org/docs/hs.keycodes.html) の値（`"f1"`〜`"f20"`, `"left"`, `"right"`, `"pad7"` など）に準じます。
+修飾キーには `"ctrl"`, `"alt"`, `"cmd"`, `"shift"`, `"fn"` が使えます（`"control"` / `"option"` / `"command"` とも書けます）。キー名は [Hammerspoon の `hs.keycodes.map`](https://www.hammerspoon.org/docs/hs.keycodes.html) の値（`"f1"`〜`"f20"`, `"left"`, `"right"`, `"pad7"` など）に準じます。
 
 #### macOS 側のショートカット確認方法
 
@@ -352,12 +393,15 @@ windows:
 | `frame` | frame | — | ウィンドウの位置とサイズ。省略すると復元時にリサイズしない。 |
 | `note` | string | — | メモ。動作には影響せず、再キャプチャしても保持される。 |
 
-**ウィンドウ照合のルール**：
+**ウィンドウ照合のルール**（復元時）：
 
-1. `bundleID` が一致するウィンドウをプールとして絞り込む
-2. `titlePattern` が指定されていれば `string.find(title, titlePattern)` で照合
-3. `titlePattern` がなければ `title` と完全一致で照合
-4. タイトル一致なしの場合、同じ `bundleID` の未割り当てウィンドウをフォールバックとして使用
+1. `ignore` に一致するウィンドウを候補から除外する
+2. `bundleID` が一致するウィンドウをプールとして絞り込む
+3. `titlePattern` が指定されていれば `string.find(title, titlePattern)` で照合
+4. `titlePattern` がなければ `title` と完全一致で照合
+5. タイトル一致なしの場合、同じ `bundleID` の未割り当てウィンドウをフォールバックとして使用
+
+**再キャプチャ時の照合**は上の 1〜4 と同じですが、**5 のフォールバックは使いません**。使うと `titlePattern` が無関係なウィンドウに吸い付き、誤った紐づけのまま保存されるためです。一致したウィンドウは既存エントリのまま現在いる Space へ移され、`frame` だけ実測値に更新されます。
 
 **Lua パターンの書き方**（PCRE とは一部異なる）：
 
@@ -396,6 +440,14 @@ frame: { x: 0, y: 25, w: 1920, h: 1055 }
 # yaml-language-server: $schema=/Users/you/.hammerspoon/Spoons/SpaceSaver.spoon/space_layouts.schema.json
 apiVersion: v1
 kind: SpaceLayouts
+
+# 記録も復元もしないウィンドウ
+ignore:
+  - bundleID: "com.google.Chrome"
+    titlePattern: "^DevTools"
+    note: "毎回位置が変わるので記録しない"
+  - bundleID: "pro.betterdisplay.BetterDisplay"   # そのアプリの全ウィンドウ
+
 screens:
   # プライマリ（中央）モニタ
   "5FEEC91C-8A4F-44AE-A28A-E335DD6F0ADD":
@@ -418,6 +470,7 @@ screens:
           - bundleID: "com.google.Chrome"
             title: "Google"
             titlePattern: "^Google"
+            note: "検索用に常に開いているウィンドウ"   # 再キャプチャしても残る
             frame: { x: 0, y: 25, w: 2560, h: 1415 }
       - type: fullscreen
         windows:
@@ -446,12 +499,12 @@ screens:
 
 - キャプチャはアクティブになった Space のウィンドウのみ正確に取得できます。Mission Control が一瞬表示されますが、**システム設定 > アクセシビリティ > 「視差効果を減らす」** を有効にすると目立たなくなります。
 - ウィンドウの照合は `bundleID + タイトル`（または `titlePattern`）のベストエフォートです。タイトルが完全に一意でないアプリでは意図しないウィンドウと照合されることがあります。
-- 復元時に余剰な Space は削除しません（不足分の追加のみ）。不要な Space は手動で削除してください。
+- 復元は Space の数を YAML に合わせます。足りなければ追加し、多すぎれば末尾から削除します。ただし macOS の制約で 1 画面につき user Space は最低 1 つ残ります。削除される Space にウィンドウが残っていると、macOS がそれらを隣の Space へ移すため配置が崩れることがあります。
 - フルスクリーン Space の並び順は復元できません（ベストエフォート）。
 - 再キャプチャは既存のエントリを引き継ぎます。`bundleID` と `title`／`titlePattern` が一致するウィンドウは、そのエントリのまま**現在いる Space** へ移され、`frame` だけ実測値に更新されます。手書きした `titlePattern` や `note` は失われません。どのウィンドウにも一致しなかったエントリ（アプリ未起動など）は元の位置に残るので、不要になったら手で削除するか `ignore` に書いてください。
   - キャプチャでは `bundleID` だけのフォールバック照合を使いません。使うと `titlePattern` が無関係なウィンドウに吸い付き、誤った紐づけのまま保存されるためです。
 - 再キャプチャすると `screens.<UUID>.metadata.name` と `metadata.frame` は実モニタ情報で上書きされます。ユーザーが追加した他のメタデータキーは保持されます。
-- 復元では Space を巡回しません。非可視 Space のウィンドウは `hs.window.filter` から取得します。ただし Hammerspoon をリロードした直後はこのキャッシュが揃っておらず、同一アプリの 2 枚目以降のウィンドウを取りこぼすことがあります。確実さを優先する場合は `spoon.SpaceSaver.rescanSpacesIfIncomplete = true` を設定すると、照合できない記述があったときだけ全 Space を巡回します（そのぶん時間がかかります）。
+- 復元では Space を巡回せず、非可視 Space のウィンドウも `hs.window.filter` から列挙します。Hammerspoon のリロード直後だけキャッシュが揃わず取りこぼすことがあります（Usage の「取りこぼし時の巡回」を参照）。
 - Space をまたぐ移動が必要なウィンドウがある場合のみ、その間だけマウスカーソルが動き Space が切り替わります（→ [Space をまたぐウィンドウ移動](#space-をまたぐウィンドウ移動)）。
 
 # Author
