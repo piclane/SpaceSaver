@@ -17,7 +17,7 @@ SpaceSaver はこの問題を次のように解決します：
    メニューバーアイコンまたはシェルコマンドで実行します。全 Space をひとつずつ自動で切り替えながら巡回し、各 Space に存在するウィンドウのアプリ情報・タイトル・位置・サイズを正確に記録します。記録結果はデータディレクトリ（デフォルト `~/.hammerspoon/`）の `space_layouts_<n>.yaml` に保存されます。**モニタ構成が異なるファイルには書き込まれないため**、自宅用・オフィス用・ノートPC単体用など複数の構成を独立して管理できます。
 
 2. **復元**（自動・モニタ接続変化時）  
-   Dock の着脱やモニタの接続・切断を検出すると、接続中のモニタ UUID の集合をキーに対応する YAML ファイルを自動で選択します。Space の数が不足していれば補完し、各 Space へウィンドウを移動してウィンドウの位置・サイズも元通りに設定します。フルスクリーン（緑ボタン）で占有している Space にも対応します。
+   Dock の着脱やモニタの接続・切断を検出すると、接続中のモニタ UUID の集合をキーに対応する YAML ファイルを自動で選択します。Space の数が不足していれば補完し、各 Space へウィンドウを移動してウィンドウの位置・サイズも元通りに設定します。フルスクリーン（緑ボタン）で占有している Space にも対応します。キャプチャと違い**復元は Space を巡回しません**。既にあるべき Space にいるウィンドウは位置・サイズを直すだけなので、多くの場合は画面が切り替わらないまま一瞬で終わります。
 
 3. **設定ファイルの手動調整**  
    生成された YAML は人間が読み書きしやすい形式で保存されます。ブラウザやターミナルのように実行中にウィンドウタイトルが変わるアプリには `titlePattern`（Lua パターン）を手書きで追記すれば、次の復元から自動でマッチします。`metadata` フィールドにはモニタ名や自由なメモを記録できます（復元には使用しません）。
@@ -57,7 +57,7 @@ SpaceSaver はこの問題を次のように解決します：
 * [yq](https://github.com/mikefarah/yq) v4（YAML 入出力に使用。なければ JSON フォールバック）
 * macOS のシステム設定：**デスクトップとDock > 「ディスプレイごとに異なるSpaceを表示」を有効**
 * Hammerspoon に **アクセシビリティ権限** を付与
-* **macOS 15.x (Sequoia) のみ**：システム設定 > キーボード > キーボードショートカット > Mission Control で **「操作スペースを左/右に移動」ショートカットが有効**（→ [Sequoia でのウィンドウ復元](#macos-sequoia-でのウィンドウ復元) を参照）
+* システム設定 > キーボード > キーボードショートカット > Mission Control で **「操作スペースを左/右に移動」ショートカットが有効**（Space をまたぐウィンドウ移動が必要な場合のみ使用。→ [Space をまたぐウィンドウ移動](#space-をまたぐウィンドウ移動) を参照）
 
 # Installation
 
@@ -183,48 +183,41 @@ spoon.SpaceSaver:start()
 
 ---
 
-## macOS Sequoia でのウィンドウ復元
+## Space をまたぐウィンドウ移動
 
-macOS 15.x (Sequoia) では、Hammerspoon が内部で使用していた private API が削除され、`hs.spaces.moveWindowToSpace` が動作しなくなりました（[Hammerspoon issue #3698](https://github.com/Hammerspoon/hammerspoon/issues/3698)）。
+macOS 15 (Sequoia) 以降、Hammerspoon が内部で使用していた private API が変更され、`hs.spaces.moveWindowToSpace` は**成功を返しながら実際にはウィンドウを移動しません**（[Hammerspoon issue #3698](https://github.com/Hammerspoon/hammerspoon/issues/3698)）。これは macOS 26 (Tahoe) でも解消していません。
 
-SpaceSaver は Sequoia 上でのみ、以下の**ドラッグ方式**で代替します：
+SpaceSaver は OS バージョンでは分岐せず、**実際に移動できたかを `hs.spaces.windowSpaces` で検算**して手段を選びます。
 
-1. ウィンドウのタイトルバーをマウスでつかむ（`leftMouseDown` + 1px ドラッグ）
-2. ドラッグを保持したまま macOS の「操作スペースを左/右に移動」ショートカットを送出し、目的の Space まで 1 つずつ移動する
-3. マウスを放してウィンドウを正確な位置・サイズに補正する
+1. ウィンドウが既に目的の Space にいる場合は、位置・サイズを合わせるだけで終わり（**Space は切り替わりません**）
+2. 移動が必要な場合はまず `hs.spaces.moveWindowToSpace` を試し、実際に移動したか検算する
+3. 移動していなければ**ドラッグ方式**に切り替える
+   1. ウィンドウのタイトルバーをマウスでつかむ（`leftMouseDown` + 1px ドラッグ）
+   2. ドラッグを保持したまま「操作スペースを左/右に移動」ショートカットを送出し、目的の Space まで 1 つずつ移動する
+   3. マウスを放してウィンドウを正確な位置・サイズに補正する
 
-このため **復元中にマウスカーソルが動き**、ウィンドウ 1 つの移動に数百 ms〜数秒かかります。macOS 14 (Sonoma) 以下、および macOS 26 (Tahoe) 以降では従来の API を使用するため、この挙動はありません。
+判定結果は Hammerspoon のセッション内で保持されるため、検算のコストがかかるのは最初の 1 ウィンドウだけです。
+
+多くの場合、復元で移動が必要なウィンドウはごく一部です。移動が不要なウィンドウしかなければ、**復元中に Space は一度も切り替わりません**。
 
 ### ショートカットの設定
 
-ドラッグ方式では、「操作スペースを左/右に移動」の **macOS 側のショートカット設定と `spaceSwitchHotkeys` を一致させる必要があります**。
+ドラッグ方式は macOS のショートカットで Space を切り替えるため、その割当が必要です。既定では **`com.apple.symbolichotkeys` から実際の割当を自動検出**するので、通常は設定不要です。テンキー割当（例: `Ctrl+Alt+Cmd+テンキー7/9`）にも対応します。
 
-#### デフォルト（Ctrl + ←/→）
-
-macOS の初期設定のままであれば追加設定は不要です：
-
-```lua
-hs.loadSpoon("SpaceSaver")
-spoon.SpaceSaver:start()
-```
-
-#### カスタムショートカットを使っている場合
-
-「操作スペースを左/右に移動」に独自のショートカットを割り当てている場合は、`spaceSwitchHotkeys` を同じキー組み合わせに設定してください。**`:start()` の前に設定すること**：
+自動検出がうまくいかない場合のみ、`spaceSwitchHotkeys` で明示します。**`:start()` の前に設定すること**：
 
 ```lua
 hs.loadSpoon("SpaceSaver")
 
--- macOS 側のショートカットに合わせて設定する（例: Ctrl+Alt+Cmd+F10/F12）
 spoon.SpaceSaver.spaceSwitchHotkeys = {
-  left  = {{"ctrl", "alt", "cmd"}, "f10"},   -- 左の Space へ移動
-  right = {{"ctrl", "alt", "cmd"}, "f12"},   -- 右の Space へ移動
+  left  = {{"ctrl", "alt", "cmd"}, "pad7"},   -- 左の Space へ移動
+  right = {{"ctrl", "alt", "cmd"}, "pad9"},   -- 右の Space へ移動
 }
 
 spoon.SpaceSaver:start()
 ```
 
-修飾キーには `"ctrl"`, `"alt"`, `"cmd"`, `"shift"` が使えます。キー名は [Hammerspoon の `hs.keycodes.map`](https://www.hammerspoon.org/docs/hs.keycodes.html) の値（`"f1"`〜`"f20"`, `"left"`, `"right"`, `"space"` など）に準じます。
+修飾キーには `"ctrl"`, `"alt"`, `"cmd"`, `"shift"` が使えます。キー名は [Hammerspoon の `hs.keycodes.map`](https://www.hammerspoon.org/docs/hs.keycodes.html) の値（`"f1"`〜`"f20"`, `"left"`, `"right"`, `"pad7"` など）に準じます。
 
 #### macOS 側のショートカット確認方法
 
@@ -232,15 +225,16 @@ spoon.SpaceSaver:start()
 
 > **ショートカットが無効になっている場合**は、チェックボックスをオンにして有効化してください。ドラッグ方式は macOS がこのショートカットを処理することで Space を切り替えるため、無効だと移動できません。
 
-### 既知の制限（Sequoia）
+### 既知の制限
 
 | 制限 | 内容 |
 |---|---|
-| 速度 | 1 ウィンドウあたり数百 ms〜数秒。ウィンドウが多いほど復元に時間がかかる |
-| マウスカーソル | 復元中にカーソルが画面上を動く |
+| 速度 | 移動が必要なウィンドウ 1 つあたり数百 ms〜数秒。移動不要なウィンドウは瞬時 |
+| マウスカーソル | ドラッグ方式が動いている間だけカーソルが画面上を動く |
 | 隣接 Space のみ移動可 | 目的の Space が離れているほど時間がかかる（途中の Space を 1 つずつ通過する） |
 | フルスクリーン Space が挟まる場合 | user Space の間にフルスクリーン Space がある構成では移動が不安定になることがある |
 | cross-screen 移動 | 別スクリーン上のウィンドウはベストエフォート（`setFrame` で寄せてからドラッグ） |
+| タイトルバーを掴めないアプリ | タブ帯を持つアプリなどでは掴み損ねることがある。連続 3 回失敗するとその起動中はドラッグ方式を諦め、位置・サイズの復元のみ行う |
 
 # Configuration Reference
 
@@ -423,7 +417,8 @@ screens:
 - 復元時に余剰な Space は削除しません（不足分の追加のみ）。不要な Space は手動で削除してください。
 - フルスクリーン Space の並び順は復元できません（ベストエフォート）。
 - 再キャプチャすると `screens.<UUID>.metadata.name` と `metadata.frame` は実モニタ情報で上書きされます。ユーザーが追加した他のメタデータキーは保持されます。
-- **macOS 15.x (Sequoia)**：ウィンドウ復元中にマウスカーソルが動きます。`spaceSwitchHotkeys` が macOS の「操作スペースを左/右に移動」ショートカットと一致していない場合、ウィンドウは移動されません（→ [macOS Sequoia でのウィンドウ復元](#macos-sequoia-でのウィンドウ復元)）。
+- 復元では Space を巡回しません。非可視 Space のウィンドウは `hs.window.filter` から取得します。ただし Hammerspoon をリロードした直後はこのキャッシュが揃っておらず、同一アプリの 2 枚目以降のウィンドウを取りこぼすことがあります。確実さを優先する場合は `spoon.SpaceSaver.rescanSpacesIfIncomplete = true` を設定すると、照合できない記述があったときだけ全 Space を巡回します（そのぶん時間がかかります）。
+- Space をまたぐ移動が必要なウィンドウがある場合のみ、その間だけマウスカーソルが動き Space が切り替わります（→ [Space をまたぐウィンドウ移動](#space-をまたぐウィンドウ移動)）。
 
 # Author
 

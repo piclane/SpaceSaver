@@ -1,0 +1,416 @@
+--[[
+  space_move.lua — SpaceSaver Spoon 内部モジュール
+  -------------------------------------------------------
+  ウィンドウを別の Space へ移動する。
+
+  hs.spaces.moveWindowToSpace は macOS 15 以降、成功を返しながら実際には
+  ウィンドウを移動しない (Hammerspoon issue #3698)。戻り値では判定できないため、
+  実行後に hs.spaces.windowSpaces で検算し、無効ならドラッグ方式へ切り替える。
+  判定結果はセッション内で保持し、2件目以降は検算を省く。
+
+  ドラッグ方式:
+    1. ウィンドウのタイトルバーをマウスでつかむ（leftMouseDown + 1px drag）
+    2. ドラッグ保持中に「操作スペースを左/右に移動」ショートカットを送出
+    3. mouseUp 後、ウィンドウフレームを正確な位置に補正
+
+  参考: https://gist.github.com/xgungnir/a02f059b29adacaf7df884920e127533
+
+  公開インターフェース:
+    M.moveWindowToSpace(win, sid, frame, hotkeys, done)
+      win     : hs.window
+      sid     : 目的 Space ID
+      frame   : {x,y,w,h} 最終フレーム（nil 可）
+      hotkeys : { left={{mods},key}, right={{mods},key} }（nil ならOS設定から自動検出）
+      done    : 完了コールバック。常に1回だけ、結果を引数に呼ばれる
+                "none"        既に目的 Space に居たのでフレーム補正のみ
+                "native"      hs.spaces.moveWindowToSpace で移動
+                "drag"        ドラッグ方式で移動
+                "failed"      移動できずフレーム補正のみ
+                "unsupported" 両手段とも無効と判明済みのため試行せずフレーム補正のみ
+--]]
+
+local M = {}
+
+-- ============================================================
+-- タイミング定数（Gist のタイミングを踏襲）
+-- ============================================================
+
+local TITLE_DX     = 5     -- タイトルバー把持点の x オフセット
+local TITLE_DY     = 18    -- 同 y オフセット（タイトルバー高さ相当）
+local GOTO_DELAY   = 0.5   -- gotoSpace 後、ウィンドウ把持までの待機（秒）
+local DOWN_DELAY   = 0.03  -- mouseDown 後（秒）
+local DRAG_DELAY   = 0.05  -- 1px ドラッグ確立後（秒）
+local KEY_DELAY    = 0.6   -- 各ショートカット送出後（Space 切替アニメ待ち）（秒）
+local KEY_HOLD     = 0.03  -- keyDown から keyUp まで（秒）
+local DROP_DELAY   = 0.1   -- mouseUp 後、フレーム復元まで（秒）
+local VERIFY_DELAY = 0.2   -- 純正 API 実行後、windowSpaces を検算するまで（秒）
+local TIMEOUT_BASE = 3.0   -- 安全タイムアウトの固定分（秒）。可変分は Space 移動段数に比例
+
+-- ============================================================
+-- 修飾キー / ショートカット設定
+-- ============================================================
+
+-- CGEventFlags のビットマスク
+local FLAG = {
+  shift      = 0x020000,
+  ctrl       = 0x040000,
+  alt        = 0x080000,
+  cmd        = 0x100000,
+  numericpad = 0x200000,
+  fn         = 0x800000,
+}
+
+local MOD_ALIAS = {
+  ctrl = "ctrl", control = "ctrl",
+  alt  = "alt",  option  = "alt",
+  cmd  = "cmd",  command = "cmd",
+  shift = "shift", fn = "fn",
+}
+
+-- macOS「システム設定 > キーボード > キーボードショートカット > Mission Control」の
+-- 「操作スペースを左/右に移動」に対応する symbolic hotkey ID
+local SYMBOLIC_ID = { left = "79", right = "81" }
+local SYMBOLIC_PLIST =
+  os.getenv("HOME") .. "/Library/Preferences/com.apple.symbolichotkeys.plist"
+
+-- hs.spaces.moveWindowToSpace が実効性を持つか。
+-- nil=未判定 / true=動く / false=動かない。一度だけ実地に試して判定する。
+local nativeMoveWorks = nil
+
+-- ドラッグ方式が実効性を持つか。nil=未判定 / false=この環境では動かない。
+-- タイトルバーを掴めるかはアプリごとに差がある（Chrome のタブ帯など）ため、
+-- 1件の失敗では諦めず、連続 DRAG_GIVEUP 回失敗した時点で環境ごと無効と判断する。
+local dragMoveWorks    = nil
+local dragFailStreak   = 0
+local DRAG_GIVEUP      = 3
+
+-- OS 設定から読んだショートカット（セッション内キャッシュ）
+local systemHotkeys = nil
+
+-- ============================================================
+-- ユーティリティ
+-- ============================================================
+
+-- hs.timer.doAfter は戻り値を保持しないとタイマーが GC され、
+-- コールバックが呼ばれないまま非同期処理が止まる。発火するまで参照を持つ。
+local pendingTimers = {}
+
+local function later(delay, fn)
+  local t
+  t = hs.timer.doAfter(delay, function()
+    pendingTimers[t] = nil
+    fn()
+  end)
+  pendingTimers[t] = true
+  return t
+end
+
+local function cancelLater(t)
+  if not t then return end
+  t:stop()
+  pendingTimers[t] = nil
+end
+
+-- ipairs テーブルから値のインデックスを返す（なければ nil）
+local function indexOf(tbl, val)
+  for i, v in ipairs(tbl) do
+    if v == val then return i end
+  end
+  return nil
+end
+
+-- win が属する Space ID の配列を返す（取得失敗時は空配列）
+local function windowSpacesOf(win)
+  local ok, r = pcall(hs.spaces.windowSpaces, win)
+  if ok and type(r) == "table" then return r end
+  return {}
+end
+
+-- frame が指定されていればウィンドウに適用する
+local function applyFrame(win, frame)
+  if not frame then return end
+  pcall(function()
+    win:setFrame(hs.geometry.rect(frame.x, frame.y, frame.w, frame.h))
+  end)
+end
+
+-- ============================================================
+-- ショートカットの解決と送出
+-- ============================================================
+
+-- bindHotkeys 形式 {{mods},key} を { keyCode, flags } に変換する（失敗時 nil）
+local function normalizeHotkey(spec)
+  if type(spec) ~= "table" then return nil end
+  if spec.keyCode then return spec end
+
+  local mods, key = spec[1], spec[2]
+  local keyCode = type(key) == "number" and key or hs.keycodes.map[key]
+  if type(keyCode) ~= "number" then return nil end
+
+  local flags = 0
+  if type(mods) == "table" then
+    for _, m in ipairs(mods) do
+      local canon = MOD_ALIAS[tostring(m):lower()]
+      if canon then flags = flags | FLAG[canon] end
+    end
+  end
+
+  -- テンキーは NX_NUMERICPADMASK が無いと macOS 側のショートカットが反応しない
+  local name = hs.keycodes.map[keyCode]
+  if type(name) == "string" and name:match("^pad") then
+    flags = flags | FLAG.numericpad
+  end
+
+  return { keyCode = keyCode, flags = flags }
+end
+
+-- macOS のショートカット設定から左右移動のキーを読む
+local function readSystemHotkeys()
+  if systemHotkeys then return systemHotkeys end
+
+  local result = {}
+  local ok, data = pcall(hs.plist.read, SYMBOLIC_PLIST)
+  local dict = ok and type(data) == "table" and data.AppleSymbolicHotKeys
+  if type(dict) == "table" then
+    for dir, id in pairs(SYMBOLIC_ID) do
+      local entry  = dict[id]
+      local params = entry and entry.value and entry.value.parameters
+      local on     = entry and (entry.enabled == true or entry.enabled == 1)
+      if on and type(params) == "table"
+         and type(params[2]) == "number" and type(params[3]) == "number" then
+        result[dir] = {
+          keyCode = math.floor(params[2]),
+          flags   = math.floor(params[3]),
+        }
+      end
+    end
+  end
+
+  systemHotkeys = result
+  return result
+end
+
+-- ユーザー設定を優先し、無ければ OS 設定から補う
+local function resolveHotkeys(userSpec)
+  local sys = readSystemHotkeys()
+  return {
+    left  = normalizeHotkey(userSpec and userSpec.left)  or sys.left,
+    right = normalizeHotkey(userSpec and userSpec.right) or sys.right,
+  }
+end
+
+-- rawFlags 付きでキーイベントを送出する
+-- hs.eventtap.keyStroke は数値パッドフラグを立てないためテンキー割当だと効かない
+local function postHotkey(hk)
+  local key = hs.keycodes.map[hk.keyCode] or hk.keyCode
+  hs.eventtap.event.newKeyEvent({}, key, true):rawFlags(hk.flags):post()
+  hs.timer.usleep(math.floor(KEY_HOLD * 1000000))
+  hs.eventtap.event.newKeyEvent({}, key, false):rawFlags(hk.flags):post()
+end
+
+-- ============================================================
+-- ドラッグ方式 Space 移動
+-- ============================================================
+
+-- ドラッグ失敗を記録する。連続で規定回数に達したら環境ごと無効と判断する
+local function noteDragFailure(reason)
+  dragFailStreak = dragFailStreak + 1
+  print(string.format("SpaceSaver(space_move): ドラッグ方式で移動できません（%s）[%d/%d]",
+    reason, dragFailStreak, DRAG_GIVEUP))
+  if dragFailStreak >= DRAG_GIVEUP and dragMoveWorks == nil then
+    dragMoveWorks = false
+    print("SpaceSaver(space_move): この環境ではドラッグ方式が機能しないと判断しました。"
+      .. "以降 Space をまたぐ移動は諦め、フレーム補正のみ行います")
+  end
+end
+
+-- win を targetSid の Space へドラッグ方式で移動する。
+-- 完了時（成功・失敗・タイムアウト問わず）に done() を必ず1回だけ呼ぶ。
+local function dragWindowToSpace(win, targetSid, frame, hotkeys, done)
+  local called       = false
+  local timeoutTimer = nil
+  local mouseIsDown  = false
+
+  -- 完了クロージャ（多重呼び出し防止）
+  local function finish(method)
+    if called then return end
+    called = true
+    cancelLater(timeoutTimer); timeoutTimer = nil
+    -- 中断時にマウスボタンを押したままにしない
+    if mouseIsDown then
+      pcall(function()
+        hs.eventtap.event.newMouseEvent(
+          hs.eventtap.event.types.leftMouseUp, hs.mouse.absolutePosition()):post()
+      end)
+      mouseIsDown = false
+    end
+    -- Space を移せなかった場合でも、せめて位置とサイズは合わせる
+    if method == "failed" then applyFrame(win, frame) end
+    done(method)
+  end
+
+  local hk = resolveHotkeys(hotkeys)
+
+  -- ============================================================
+  -- 目的スクリーン・インデックス・現在 Space を特定
+  -- ============================================================
+
+  local screenUUID = hs.spaces.spaceDisplay(targetSid)
+  if not screenUUID then
+    print("SpaceSaver(space_move): spaceDisplay 失敗 sid=" .. tostring(targetSid))
+    finish("failed"); return
+  end
+
+  local allSpaces = hs.spaces.spacesForScreen(screenUUID) or {}
+  local targetIdx = indexOf(allSpaces, targetSid)
+  if not targetIdx then
+    print("SpaceSaver(space_move): targetSid が spacesForScreen に見つからない")
+    finish("failed"); return
+  end
+
+  -- ドラッグ本体（curIdx / targetIdx 確定後）
+  local function performDrag(curSid, curIdx)
+    local steps = math.abs(targetIdx - curIdx)
+    local dir   = targetIdx > curIdx and "right" or "left"
+    if not hk[dir] then
+      print(string.format(
+        "SpaceSaver(space_move): 「操作スペースを%sに移動」のショートカットが未設定のため移動できない",
+        dir == "right" and "右" or "左"))
+      finish("failed"); return
+    end
+
+    -- フェイルセーフ: 想定所要時間を超えたら強制完了（復元全体が止まらないよう）
+    timeoutTimer = later(
+      TIMEOUT_BASE + GOTO_DELAY + steps * (KEY_DELAY + KEY_HOLD),
+      function()
+        noteDragFailure("タイムアウト")
+        finish("failed")
+      end)
+
+    -- 現在 Space に移動してウィンドウを最前面化
+    pcall(hs.spaces.gotoSpace, curSid)
+    later(GOTO_DELAY, function()
+      pcall(function() win:raise() end)
+
+      -- タイトルバーをつかむ（mouseDown + 1px drag）
+      local f   = win:frame()
+      local pt  = hs.geometry.point(f.x + TITLE_DX, f.y + TITLE_DY)
+      local ptD = hs.geometry.point(pt.x + 1, pt.y)
+
+      hs.mouse.absolutePosition(pt)
+      hs.eventtap.event.newMouseEvent(
+        hs.eventtap.event.types.leftMouseDown, pt):post()
+      mouseIsDown = true
+
+      later(DOWN_DELAY, function()
+        -- 1px ドラッグでウィンドウをつかんでいる状態を OS に認識させる
+        hs.eventtap.event.newMouseEvent(
+          hs.eventtap.event.types.leftMouseDragged, ptD)
+          :setProperty(hs.eventtap.event.properties.mouseEventDeltaX, 1)
+          :post()
+
+        later(DRAG_DELAY, function()
+          local function sendKey(n)
+            if n > steps then
+              -- マウスを放す → フレーム復元
+              hs.eventtap.event.newMouseEvent(
+                hs.eventtap.event.types.leftMouseUp,
+                hs.mouse.absolutePosition()):post()
+              mouseIsDown = false
+
+              later(DROP_DELAY, function()
+                applyFrame(win, frame)
+                -- 合成マウスイベントでウィンドウを掴めていないと、
+                -- Space だけが切り替わって取り残される。実際に移れたか検算する
+                if indexOf(windowSpacesOf(win), targetSid) then
+                  dragMoveWorks  = true
+                  dragFailStreak = 0
+                  finish("drag")
+                else
+                  noteDragFailure("ウィンドウを掴めない")
+                  finish("failed")
+                end
+              end)
+              return
+            end
+            -- ドラッグ保持中にショートカット送出（1 Space ずつ移動）
+            postHotkey(hk[dir])
+            later(KEY_DELAY, function() sendKey(n + 1) end)
+          end
+
+          sendKey(1)
+        end)
+      end)
+    end)
+  end
+
+  -- ウィンドウが現在いる Space を、目的スクリーンの allSpaces から探す
+  local curSid = nil
+  for _, s in ipairs(windowSpacesOf(win)) do
+    if indexOf(allSpaces, s) then curSid = s; break end
+  end
+
+  if curSid then
+    -- 同一スクリーン上にある（通常ケース）
+    performDrag(curSid, indexOf(allSpaces, curSid))
+  else
+    -- 別スクリーン上にある（cross-screen）:
+    -- setFrame で目的スクリーンへ寄せ、activeSpaceOnScreen で現在 Space を取得
+    applyFrame(win, frame)
+    later(0.1, function()
+      local ok, cs = pcall(hs.spaces.activeSpaceOnScreen, screenUUID)
+      local ci = ok and cs and indexOf(allSpaces, cs)
+      if not ci then
+        print("SpaceSaver(space_move): cross-screen 現在 Space 特定失敗")
+        finish("failed"); return
+      end
+      performDrag(cs, ci)
+    end)
+  end
+end
+
+-- ============================================================
+-- 公開 API
+-- ============================================================
+
+--- win を targetSid の Space へ移動し、frame を適用する。
+--- done(method) は常に1回だけ呼ばれる。
+function M.moveWindowToSpace(win, targetSid, frame, hotkeys, done)
+  -- 既に目的 Space に居るならフレーム補正のみ。Space は切り替えない
+  if indexOf(windowSpacesOf(win), targetSid) then
+    applyFrame(win, frame)
+    -- doAfter(0) で再帰スタック増大を防ぎつつ次タスクへ
+    later(0, function() done("none") end)
+    return
+  end
+
+  -- どちらの手段も無効と判明している場合、Space を切り替えずフレームだけ合わせる
+  if nativeMoveWorks == false and dragMoveWorks == false then
+    applyFrame(win, frame)
+    later(0, function() done("unsupported") end)
+    return
+  end
+
+  if nativeMoveWorks == false then
+    dragWindowToSpace(win, targetSid, frame, hotkeys, done)
+    return
+  end
+
+  -- 純正 API は macOS 15 以降 true を返しつつ移動しないため、戻り値ではなく実効を見る
+  pcall(hs.spaces.moveWindowToSpace, win, targetSid)
+  later(VERIFY_DELAY, function()
+    if indexOf(windowSpacesOf(win), targetSid) then
+      nativeMoveWorks = true
+      applyFrame(win, frame)
+      done("native")
+    else
+      if nativeMoveWorks == nil then
+        nativeMoveWorks = false
+        print("SpaceSaver(space_move): hs.spaces.moveWindowToSpace が無効。ドラッグ方式に切り替え")
+      end
+      dragWindowToSpace(win, targetSid, frame, hotkeys, done)
+    end
+  end)
+end
+
+return M

@@ -41,9 +41,9 @@
     - yq (https://github.com/mikefarah/yq) v4 が
       /opt/homebrew/bin/yq または PATH に存在すること
     - （推奨）「視差効果を減らす」を有効にするとキャプチャ中の画面切替が目立たなくなる
-    - （macOS 15.x=Sequoia のみ）システム設定 > キーボード > Mission Control >
-      「操作スペースを左/右に移動」ショートカットが有効であり、
-      spaceSwitchHotkeys の設定と一致していること
+    - システム設定 > キーボード > キーボードショートカット > Mission Control >
+      「操作スペースを左/右に移動」ショートカットが有効であること
+      （Spaceをまたぐ移動が必要な場合のみ使用。割当はOS設定から自動検出する）
 
   既知の制限:
     - Luaパターン照合（完全なPCREではない）
@@ -52,8 +52,9 @@
     - キャプチャ中はMission Controlが各Spaceぶん切り替わる
     - 再キャプチャでscreen.metadata.name/frameは実情報で上書き（ユーザーが追加した他キーは温存）
     - yq不在時はJSONフォールバック（space_layouts_<n>.json）で動作
-    - macOS 15.x (Sequoia): ドラッグ方式でウィンドウを移動するため、
-      復元中にマウスカーソルが動く。1ウィンドウあたり数百ms〜数秒かかる
+    - Spaceをまたぐ移動が必要なウィンドウはドラッグ方式で移動するため、
+      その間だけマウスカーソルが動き、Spaceが切り替わる
+      （hs.spaces.moveWindowToSpace は macOS 15 以降、成功を返しつつ移動しない）
 --]]
 
 local obj = {}
@@ -70,22 +71,27 @@ obj.license  = "MIT - https://opensource.org/licenses/MIT"
 -- :start() の前に上書き可能。
 obj.dataDir  = hs.configdir
 
--- macOS 15.x (Sequoia) 専用: ドラッグ方式 Space 移動で送出するショートカット。
--- macOS「システム設定 > キーボード > Mission Control >
---   操作スペースを左/右に移動」の設定と一致させること。
--- 形式は bindHotkeys と同じ {{修飾キー...}, キー}。:start() の前後どちらでも上書き可。
--- 例（カスタム設定の場合）:
+-- ドラッグ方式 Space 移動で送出するショートカット。
+-- 既定の nil では macOS「システム設定 > キーボード > キーボードショートカット >
+--   Mission Control > 操作スペースを左/右に移動」の割当を自動検出する。
+-- 自動検出が効かない環境でのみ、bindHotkeys と同じ {{修飾キー...}, キー} 形式で明示する。
+-- 例:
 --   spoon.SpaceSaver.spaceSwitchHotkeys = {
---     left  = {{"ctrl","alt","cmd"}, "f10"},
---     right = {{"ctrl","alt","cmd"}, "f12"},
+--     left  = {{"ctrl","alt","cmd"}, "pad7"},
+--     right = {{"ctrl","alt","cmd"}, "pad9"},
 --   }
-obj.spaceSwitchHotkeys = {
-  left  = {{"ctrl"}, "left"},   -- 左の Space へ
-  right = {{"ctrl"}, "right"},  -- 右の Space へ
-}
+obj.spaceSwitchHotkeys = nil
 
--- Sequoia 専用 moveWindowToSpace 代替モジュール（sequoia_move.lua）を読み込む
-local seqMove = dofile(hs.spoons.resourcePath("sequoia_move.lua"))
+-- 照合できないウィンドウがあったとき、全 Space を巡回して取り直すか。
+-- 通常は hs.window.filter が非可視 Space のウィンドウも保持しているため巡回は不要で、
+-- 既定では巡回しない（有効にすると Space 数だけ画面が切り替わり数十秒かかる）。
+-- Hammerspoon をリロードした直後は filter のキャッシュが揃っておらず、
+-- 同一アプリの2枚目以降のウィンドウを取りこぼすことがある。
+-- そこまで確実に復元したい場合のみ true にする。
+obj.rescanSpacesIfIncomplete = false
+
+-- Space 移動モジュール（space_move.lua）を読み込む
+local spaceMove = dofile(hs.spoons.resourcePath("space_move.lua"))
 
 -- ============================================================
 -- 設定定数
@@ -117,6 +123,7 @@ local busy             = false -- キャプチャ中フラグ（多重起動防�
 local screenWatcher    = nil
 local screenTimer      = nil
 local menubar          = nil
+local windowFilter     = nil   -- 非可視Spaceも含むウィンドウ列挙用（遅延生成）
 
 -- ============================================================
 -- ユーティリティ
@@ -396,6 +403,85 @@ local function spaceIsFullscreen(sid)
 end
 
 -- ============================================================
+-- ウィンドウプール
+-- ============================================================
+
+-- ウィンドウ列挙用の window filter を返す（初回のみ生成）。
+-- hs.window.allWindows() は可視 Space のウィンドウしか返さないが、
+-- hs.window.filter はウィンドウ生成イベントを購読して非可視 Space の分も保持する。
+-- keepActive() で常時追跡させ、Space を巡回せずに全ウィンドウを列挙できるようにする。
+local function ensureWindowFilter()
+  if not windowFilter then
+    windowFilter = hs.window.filter.new(false)
+      :setDefaultFilter({})
+      :setOverrideFilter({})
+    windowFilter:keepActive()
+  end
+  return windowFilter
+end
+
+-- win から { win=..., desc=... } のプールエントリを作る（対象外なら nil）
+local function poolEntry(win)
+  -- Finder のデスクトップは AXScrollArea だが isStandard() が真になる。
+  -- hs.window.allWindows() と同じく role で弾かないとレイアウトの Finder 指定を横取りする
+  local role = nil
+  pcall(function() role = win:role() end)
+  if role ~= "AXWindow" then return nil end
+
+  local isStd = false
+  pcall(function() isStd = win:isStandard() end)
+  if not isStd then return nil end
+
+  local desc = windowDescriptor(win)
+  if not desc then return nil end
+  return { win = win, desc = desc }
+end
+
+-- Space を切り替えずにウィンドウプールを構築する
+local function buildPool()
+  local pool = {}
+  for _, win in ipairs(ensureWindowFilter():getWindows()) do
+    local entry = poolEntry(win)
+    if entry then table.insert(pool, entry) end
+  end
+  return pool
+end
+
+-- レイアウト中の記述をプールで賄えるか調べ、賄えなかった記述を返す。
+-- 配置対象と同じく接続中の画面だけを見る。pool は消費せずコピー上で照合する。
+local function unmatchedDescriptors(pool, data)
+  local rest = {}
+  for i, e in ipairs(pool) do rest[i] = e end
+
+  local missing = {}
+  for uuid, screenData in pairs(data.screens) do
+    if hs.screen.find(uuid) then
+      for _, sp in ipairs(screenData.spaces or {}) do
+        for _, desc in ipairs(sp.windows or {}) do
+          if not takeMatchingWindow(desc, rest) then
+            table.insert(missing, desc)
+          end
+        end
+      end
+    end
+  end
+  return missing
+end
+
+-- 未照合の記述のうち、アプリが起動中のものを返す。
+-- アプリが起動していないなら単にウィンドウが存在しないだけで、巡回しても見つからない。
+local function missingButRunning(missing)
+  local result = {}
+  for _, desc in ipairs(missing) do
+    if desc.bundleID then
+      local apps = hs.application.applicationsForBundleID(desc.bundleID)
+      if apps and #apps > 0 then table.insert(result, desc) end
+    end
+  end
+  return result
+end
+
+-- ============================================================
 -- updateMenu の前方宣言（capture 内の finish() から呼ばれる）
 -- ============================================================
 
@@ -581,26 +667,36 @@ local function restoreCurrentConfig()
     end
   end
 
-  -- 元のアクティブ Space に戻して Mission Control を閉じ、完了通知する
+  -- Space を切り替えた場合だけ元のアクティブ Space に戻し、Mission Control を閉じる。
+  -- 切り替えていなければ画面はそのままなので、余計な切替を挟まず即座に終える。
+  local spacesTouched = (#ops > 0)
+
+  local function announceDone()
+    busy = false
+    hs.alert.closeAll()
+    hs.alert.show("SpaceSaver: [" .. basename(path) .. "] 復元完了")
+    print("SpaceSaver: [" .. basename(path) .. "] 復元完了")
+  end
+
   local function finish()
+    if not spacesTouched then
+      announceDone()
+      return
+    end
     for uuid, sid in pairs(originalActive) do
       pcall(hs.spaces.gotoSpace, sid)
     end
     later(CAPTURE_SETTLE, function()
       pcall(hs.spaces.closeMissionControl)
-      busy = false
-      hs.alert.closeAll()
-      hs.alert.show("SpaceSaver: [" .. basename(path) .. "] 復元完了")
-      print("SpaceSaver: [" .. basename(path) .. "] 復元完了")
+      announceDone()
     end)
   end
 
   -- 事前に収集したウィンドウプールを使って各画面のウィンドウを配置する。
   -- pool 要素は { win=ウィンドウ, desc=windowDescriptor } のキャッシュ済みエントリ。
-  -- ① タスクリストを同期的に構築（pool消費順を現状維持）し、
-  -- ② seqMove.moveWindowToSpace で逐次・非同期に実行する。
-  --    macOS 15.x(Sequoia): ドラッグ方式（非同期・数秒/ウィンドウ）
-  --    それ以外            : hs.spaces.moveWindowToSpace（ほぼ即時）
+  -- ① タスクリストを同期的に構築し、
+  -- ② spaceMove.moveWindowToSpace で逐次・非同期に実行する。
+  --    既に目的 Space に居るウィンドウはフレーム補正のみで、Space は切り替わらない。
   local function placeWindows(pool)
     -- ① タスクリスト構築（pool.takeMatchingWindow の消費順を現状と同一に保つ）
     local tasks = {}
@@ -660,22 +756,29 @@ local function restoreCurrentConfig()
       end
     end
 
-    -- ② タスクを逐次・非同期で実行（Sequoia はドラッグ方式なので1件ずつ待つ）
+    -- ② タスクを逐次・非同期で実行（ドラッグ方式に落ちる場合があるので1件ずつ待つ）
     local function runTask(i)
       if i > #tasks then finish(); return end
       local t = tasks[i]
       if t.kind == "fullscreen" then
-        pcall(function() t.win:setFullScreen(true) end)
+        -- 既にフルスクリーンなら何もしない（setFullScreen は Space 切替を伴う）
+        local already = false
+        pcall(function() already = t.win:isFullScreen() end)
+        if not already then pcall(function() t.win:setFullScreen(true) end) end
         local note = t.matchKind == "bundle" and " (bundleIDのみ一致)" or ""
-        print(string.format("配置 %s actualTitle=[%s] -> screen=[%s] fullscreen%s",
-          descKeyLabel(t.desc), t.actualTitle, t.uuid, note))
+        print(string.format("配置 %s actualTitle=[%s] -> screen=[%s] fullscreen%s%s",
+          descKeyLabel(t.desc), t.actualTitle, t.uuid,
+          already and " (変更なし)" or "", note))
         runTask(i + 1)
       elseif t.kind == "space" then
-        seqMove.moveWindowToSpace(t.win, t.sid, t.desc.frame, obj.spaceSwitchHotkeys,
-          function()
+        spaceMove.moveWindowToSpace(t.win, t.sid, t.desc.frame, obj.spaceSwitchHotkeys,
+          function(method)
+            if method == "drag" or method == "failed" then spacesTouched = true end
             local note = t.matchKind == "bundle" and " (bundleIDのみ一致)" or ""
-            print(string.format("配置 %s actualTitle=[%s] -> screen=[%s] userSpace#%d spaceID=[%s]%s",
-              descKeyLabel(t.desc), t.actualTitle, t.uuid, t.userIdx, tostring(t.sid), note))
+            print(string.format(
+              "配置 %s actualTitle=[%s] -> screen=[%s] userSpace#%d spaceID=[%s] move=[%s]%s",
+              descKeyLabel(t.desc), t.actualTitle, t.uuid, t.userIdx,
+              tostring(t.sid), method, note))
             runTask(i + 1)
           end)
       else
@@ -686,41 +789,65 @@ local function restoreCurrentConfig()
     runTask(1)
   end
 
-  -- 全画面の全 Space を巡回してウィンドウプールを構築し、placeWindows を呼ぶ。
-  -- キャプチャの step() と同じ方式で非アクティブ Space のウィンドウも確実に収集する。
-  local function buildPoolAndPlace()
+  -- 全 Space を巡回してウィンドウプールを取り直す（フォールバック）。
+  -- hs.window.filter のキャッシュが不完全だったときだけ通る経路。
+  local function rescanSpaces(pool, onDone)
     local worklist = {}
     for _, plan in ipairs(screenPlans) do
       for _, sid in ipairs(hs.spaces.spacesForScreen(plan.uuid) or {}) do
-        table.insert(worklist, { sid = sid })
+        table.insert(worklist, sid)
       end
     end
-    local pool, seen = {}, {}
+
+    local seen = {}
+    for _, e in ipairs(pool) do
+      local id = e.win:id()
+      if id then seen[id] = true end
+    end
+
+    spacesTouched = true
     local function step(i)
-      if i > #worklist then placeWindows(pool); return end
-      pcall(hs.spaces.gotoSpace, worklist[i].sid)
+      if i > #worklist then onDone(pool); return end
+      pcall(hs.spaces.gotoSpace, worklist[i])
       later(CAPTURE_SETTLE, function()
-        local wok, winIDs = pcall(hs.spaces.windowsForSpace, worklist[i].sid)
+        local wok, winIDs = pcall(hs.spaces.windowsForSpace, worklist[i])
         if wok and winIDs then
           for _, wid in ipairs(winIDs) do
             if not seen[wid] then
+              seen[wid] = true
               local win = hs.window.get(wid)
-              local isStd = false
-              if win then pcall(function() isStd = win:isStandard() end) end
-              if win and isStd then
-                local desc = windowDescriptor(win)
-                if desc then
-                  seen[wid] = true
-                  table.insert(pool, { win = win, desc = desc })
-                end
-              end
+              local entry = win and poolEntry(win)
+              if entry then table.insert(pool, entry) end
             end
           end
         end
         step(i + 1)
       end)
     end
-    if #worklist == 0 then placeWindows(pool) else step(1) end
+
+    if #worklist == 0 then onDone(pool) else step(1) end
+  end
+
+  -- Space を切り替えずにプールを組んで配置する。
+  -- アプリが起動中なのに照合できなかった記述は、ウィンドウ列挙の取りこぼしか
+  -- レイアウトの記述ずれのどちらかなので、判断材料としてログに出す。
+  local function buildPoolAndPlace()
+    local pool     = buildPool()
+    local unmet    = missingButRunning(unmatchedDescriptors(pool, data))
+
+    if #unmet > 0 then
+      print(string.format("SpaceSaver: アプリ起動中だが照合できない記述が %d 件あります", #unmet))
+      for _, desc in ipairs(unmet) do
+        print("  " .. descKeyLabel(desc))
+      end
+      if obj.rescanSpacesIfIncomplete then
+        print("SpaceSaver: rescanSpacesIfIncomplete により全 Space を巡回して取り直します")
+        rescanSpaces(pool, placeWindows)
+        return
+      end
+    end
+
+    placeWindows(pool)
   end
 
   -- 操作キューを1つずつ非同期で実行（Mission Control の競合を避けるため逐次・遅延つき）
@@ -844,6 +971,10 @@ end
 function obj:start()
   trackedSignature = screenSignature(currentScreenSet())
 
+  -- ここから追跡を始めることで、以後に生成されたウィンドウは
+  -- 非可視 Space のものも取りこぼさずプールに載る
+  ensureWindowFilter()
+
   -- メニューバー
   menubar = hs.menubar.new()
   if menubar then
@@ -877,6 +1008,7 @@ function obj:stop()
   if screenWatcher then screenWatcher:stop(); screenWatcher = nil end
   if screenTimer   then screenTimer:stop();   screenTimer   = nil end
   if menubar       then menubar:delete();      menubar       = nil end
+  if windowFilter  then windowFilter:delete();          windowFilter = nil end
   hs.urlevent.bind("space-capture", nil)
   hs.urlevent.bind("space-restore", nil)
   print("SpaceSaver: 停止")
