@@ -410,10 +410,57 @@ local function takeMatchingWindow(desc, pool)
   return nil, nil
 end
 
+-- titlePattern の「自由度の低さ」を数える。
+-- 必ず一致しなければならないリテラル文字を数え、位置を固定するアンカーを加点する。
+-- '.*' は 0、'^SpaceSaver.spoon – ' は 20 前後になる。
+-- 厳密な尺度ではなく、どちらがより具体的かを比べるための目安。
+local function patternSpecificity(pat)
+  if type(pat) ~= "string" then return 0 end
+  local score, i, n = 0, 1, #pat
+  while i <= n do
+    local c, literal = pat:sub(i, i), false
+    if c == "%" then
+      -- %a %d などは文字クラス、%. %- などはリテラル
+      literal = pat:sub(i + 1, i + 1):match("%a") == nil
+      i = i + 2
+    elseif c == "[" then
+      -- 文字クラスは閉じ括弧まで読み飛ばす（先頭の ] はリテラル扱い）
+      i = (pat:find("]", i + 2, true) or n) + 1
+    elseif c == "." then
+      i = i + 1
+    elseif c == "^" or c == "$" then
+      score = score + 1
+      i = i + 1
+    else
+      literal = true
+      i = i + 1
+    end
+    -- 直後の量指定子。* - ? が付くと省略できるので必須文字とは数えない
+    local q = pat:sub(i, i)
+    if q == "*" or q == "-" or q == "?" then
+      literal = false
+      i = i + 1
+    elseif q == "+" then
+      i = i + 1
+    end
+    if literal then score = score + 1 end
+  end
+  return score
+end
+
+-- 記述の絞り込みの強さ。大きいほど自由度が低い。
+-- title の完全一致はどのパターンより強い
+local function descSpecificity(desc)
+  if desc.titlePattern then return patternSpecificity(desc.titlePattern) end
+  return 1000 + #(desc.title or "")
+end
+
 -- レイアウトのスロットにウィンドウを割り当てる。
--- 候補が少ない記述から順に確定させる。レイアウトの記述順で素朴に取っていくと、
--- '.*' のように広く当たるパターンが、特定のウィンドウを名指しする記述の
--- 取り分を先に奪ってしまう（例: '.*' が drum2midi を取り、'^drum2midi – ' が未配置になる）。
+-- 優先順位は 1) 候補が少ない記述 2) 自由度が低い記述 3) レイアウトの記述順。
+-- 記述順で素朴に取っていくと、'.*' のように広く当たるパターンが、
+-- 特定のウィンドウを名指しする記述の取り分を先に奪ってしまう。
+-- 候補数だけで決めても、そのアプリのウィンドウが1枚しか見つかっていないときは
+-- 候補数が並び、記述順次第で入れ替わる。
 -- まずタイトル/パターン一致で割り当て、残りを同 bundleID のフォールバックで埋める。
 local function assignWindows(slots, pool)
   local remaining = {}
@@ -433,13 +480,20 @@ local function assignWindows(slots, pool)
 
   local function assignPass(byTitle)
     while true do
-      local bestSlot, bestCount, bestIdx
+      local bestSlot, bestCount, bestSpec, bestIdx
       for _, slot in ipairs(slots) do
         if not slot.entry and not slot.noSpace then
           local c = candidates(slot.desc, byTitle)
-          -- 同数ならレイアウト順で先のスロットを優先する
-          if #c > 0 and (not bestCount or #c < bestCount) then
-            bestSlot, bestCount, bestIdx = slot, #c, c[1]
+          if #c > 0 then
+            local spec = descSpecificity(slot.desc)
+            -- 候補が少ない順。同数なら自由度が低い記述を優先し、
+            -- それも同じならレイアウト順で先のスロットを取る。
+            -- 候補数だけで決めると、プールに1枚しか無いときに
+            -- '.*' と '^SpaceSaver.spoon – ' が並び、記述順次第で入れ替わる
+            if not bestCount or #c < bestCount
+               or (#c == bestCount and spec > bestSpec) then
+              bestSlot, bestCount, bestSpec, bestIdx = slot, #c, spec, c[1]
+            end
           end
         end
       end
