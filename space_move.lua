@@ -13,6 +13,11 @@
     2. ドラッグ保持中に「操作スペースを左/右に移動」ショートカットを送出
     3. mouseUp 後、ウィンドウフレームを正確な位置に補正
 
+  ただしタイトルバーを自前で描くアプリ（Google Chrome など）では、
+  掴めてもウィンドウが Space の切替について来ない。純正 API も効かないため、
+  そうしたアプリは Space をまたいで移動できない。アプリ単位で連続失敗を数え、
+  規定回数に達したら以降そのアプリでは試さずフレーム補正だけ行う。
+
   参考: https://gist.github.com/xgungnir/a02f059b29adacaf7df884920e127533
 
   公開インターフェース:
@@ -35,7 +40,8 @@
                 "native"      hs.spaces.moveWindowToSpace で移動
                 "drag"        ドラッグ方式で移動
                 "failed"      移動できずフレーム補正のみ
-                "unsupported" 両手段とも無効と判明済みのため試行せずフレーム補正のみ
+                "unsupported" このアプリでは移動できないと判明済みのため
+                              試行せずフレーム補正のみ
 --]]
 
 local M = {}
@@ -91,12 +97,14 @@ local SYMBOLIC_PLIST =
 -- nil=未判定 / true=動く / false=動かない。一度だけ実地に試して判定する。
 local nativeMoveWorks = nil
 
--- ドラッグ方式が実効性を持つか。nil=未判定 / false=この環境では動かない。
--- タイトルバーを掴めるかはアプリごとに差がある（Chrome のタブ帯など）ため、
--- 1件の失敗では諦めず、連続 DRAG_GIVEUP 回失敗した時点で環境ごと無効と判断する。
-local dragMoveWorks    = nil
-local dragFailStreak   = 0
-local DRAG_GIVEUP      = 3
+-- ドラッグ方式が使えるかはアプリごとに違う。
+-- Chrome のようにタイトルバーを自前で描くアプリは、掴めてもウィンドウが
+-- Space の切替について来ない（純正 API も効かないので移動手段が無い）。
+-- アプリ単位で連続失敗を数え、規定回数に達したらそのアプリでは以降試さない。
+-- 全体で1つのフラグにすると、1つのアプリの失敗で他のアプリまで諦めてしまう。
+local dragFailures = {}   -- bundleID -> 連続失敗回数
+local dragBlocked  = {}   -- bundleID -> true なら以降ドラッグを試さない
+local DRAG_GIVEUP  = 3    -- 同じアプリでも成否が揺れることがあるので少し余裕を持たせる
 
 -- OS 設定から読んだショートカット（セッション内キャッシュ）
 local systemHotkeys = nil
@@ -146,6 +154,15 @@ local function applyFrame(win, frame)
   pcall(function()
     win:setFrame(hs.geometry.rect(frame.x, frame.y, frame.w, frame.h))
   end)
+end
+
+-- win のアプリの bundleID を返す（取れなければ "?"）
+local function bundleIDOf(win)
+  local ok, bid = pcall(function()
+    local app = win:application()
+    return app and app:bundleID() or nil
+  end)
+  return (ok and bid) or "?"
 end
 
 -- win が今いるスクリーンの UUID を返す（判定できなければ nil）。
@@ -247,15 +264,16 @@ end
 -- ドラッグ方式 Space 移動
 -- ============================================================
 
--- ドラッグ失敗を記録する。連続で規定回数に達したら環境ごと無効と判断する
-local function noteDragFailure(reason)
-  dragFailStreak = dragFailStreak + 1
-  print(string.format("SpaceSaver(space_move): ドラッグ方式で移動できません（%s）[%d/%d]",
-    reason, dragFailStreak, DRAG_GIVEUP))
-  if dragFailStreak >= DRAG_GIVEUP and dragMoveWorks == nil then
-    dragMoveWorks = false
-    print("SpaceSaver(space_move): この環境ではドラッグ方式が機能しないと判断しました。"
-      .. "以降 Space をまたぐ移動は諦め、フレーム補正のみ行います")
+-- ドラッグ失敗をアプリ単位で記録する。連続で規定回数に達したらそのアプリを諦める
+local function noteDragFailure(win, reason)
+  local bid = bundleIDOf(win)
+  dragFailures[bid] = (dragFailures[bid] or 0) + 1
+  print(string.format("SpaceSaver(space_move): %s をドラッグで移動できません（%s）[%d/%d]",
+    bid, reason, dragFailures[bid], DRAG_GIVEUP))
+  if dragFailures[bid] >= DRAG_GIVEUP and not dragBlocked[bid] then
+    dragBlocked[bid] = true
+    print(string.format("SpaceSaver(space_move): %s は Space をまたぐ移動に対応できないと判断しました。"
+      .. "以降このアプリではフレーム補正のみ行います", bid))
   end
 end
 
@@ -318,7 +336,7 @@ local function dragWindowToSpace(win, targetSid, frame, hotkeys, done)
     timeoutTimer = later(
       TIMEOUT_BASE + GOTO_DELAY + steps * (KEY_DELAY + KEY_HOLD),
       function()
-        noteDragFailure("タイムアウト")
+        noteDragFailure(win, "タイムアウト")
         finish("failed")
       end)
 
@@ -358,11 +376,10 @@ local function dragWindowToSpace(win, targetSid, frame, hotkeys, done)
                 -- 合成マウスイベントでウィンドウを掴めていないと、
                 -- Space だけが切り替わって取り残される。実際に移れたか検算する
                 if indexOf(windowSpacesOf(win), targetSid) then
-                  dragMoveWorks  = true
-                  dragFailStreak = 0
+                  dragFailures[bundleIDOf(win)] = 0
                   finish("drag")
                 else
-                  noteDragFailure("ウィンドウを掴めない")
+                  noteDragFailure(win, "Space の切替について来ない")
                   finish("failed")
                 end
               end)
@@ -465,7 +482,7 @@ function M.moveWindowToSpace(win, targetSid, frame, hotkeys, done)
   end
 
   -- どちらの手段も無効と判明している場合、Space を切り替えずフレームだけ合わせる
-  if nativeMoveWorks == false and dragMoveWorks == false then
+  if nativeMoveWorks == false and dragBlocked[bundleIDOf(win)] then
     applyFrame(win, frame)
     later(0, function() done("unsupported") end)
     return
