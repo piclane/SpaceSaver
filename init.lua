@@ -63,6 +63,8 @@
     - Spaceをまたぐ移動が必要なウィンドウはドラッグ方式で移動するため、
       その間だけマウスカーソルが動き、Spaceが切り替わる
       （hs.spaces.moveWindowToSpace は macOS 15 以降、成功を返しつつ移動しない）
+    - タイトルバーを自前で描くアプリ（Google Chromeなど）は
+      同一モニタ内でSpaceをまたぐ移動ができない。別モニタへの移動はsetFrameで可能
 --]]
 
 local obj = {}
@@ -408,6 +410,49 @@ local function takeMatchingWindow(desc, pool)
   return nil, nil
 end
 
+-- レイアウトのスロットにウィンドウを割り当てる。
+-- 候補が少ない記述から順に確定させる。レイアウトの記述順で素朴に取っていくと、
+-- '.*' のように広く当たるパターンが、特定のウィンドウを名指しする記述の
+-- 取り分を先に奪ってしまう（例: '.*' が drum2midi を取り、'^drum2midi – ' が未配置になる）。
+-- まずタイトル/パターン一致で割り当て、残りを同 bundleID のフォールバックで埋める。
+local function assignWindows(slots, pool)
+  local remaining = {}
+  for i, e in ipairs(pool) do remaining[i] = e end
+
+  -- desc に当たる remaining の添字一覧。byTitle=false なら bundleID だけで見る
+  local function candidates(desc, byTitle)
+    local list = {}
+    for i, entry in ipairs(remaining) do
+      if entry.desc.bundleID == desc.bundleID
+         and (not byTitle or titleMatches(desc, entry.desc.title)) then
+        table.insert(list, i)
+      end
+    end
+    return list
+  end
+
+  local function assignPass(byTitle)
+    while true do
+      local bestSlot, bestCount, bestIdx
+      for _, slot in ipairs(slots) do
+        if not slot.entry and not slot.noSpace then
+          local c = candidates(slot.desc, byTitle)
+          -- 同数ならレイアウト順で先のスロットを優先する
+          if #c > 0 and (not bestCount or #c < bestCount) then
+            bestSlot, bestCount, bestIdx = slot, #c, c[1]
+          end
+        end
+      end
+      if not bestSlot then return end
+      bestSlot.entry     = table.remove(remaining, bestIdx)
+      bestSlot.matchKind = byTitle and "title" or "bundle"
+    end
+  end
+
+  assignPass(true)
+  assignPass(false)
+end
+
 -- desc のタイトル指定 (pattern または title) と bundleID を "[key]=[val] bundleID=[...]" で返す
 local function descKeyLabel(desc)
   local key = desc.titlePattern and "pattern" or "title"
@@ -525,25 +570,28 @@ local function buildPool(ignoreRules)
 end
 
 -- レイアウト中の記述をプールで賄えるか調べ、賄えなかった記述を返す。
--- 配置対象と同じく接続中の画面だけを見る。pool は消費せずコピー上で照合する。
+-- 配置と同じ割り当て規則を使うので、結果は実際の配置と一致する。
 local function unmatchedDescriptors(pool, data)
-  local rest = {}
-  for i, e in ipairs(pool) do rest[i] = e end
-
-  local missing = {}
+  local slots = {}
   for uuid, screenData in pairs(data.screens) do
     if hs.screen.find(uuid) then
       for _, sp in ipairs(screenData.spaces or {}) do
         for _, desc in ipairs(sp.windows or {}) do
           -- ignore に一致する記述は意図的に配置しないので、取りこぼしとして数えない
           -- （次のキャプチャで削除される）
-          if not isIgnored(data.ignore, desc.bundleID, desc.title)
-             and not takeMatchingWindow(desc, rest) then
-            table.insert(missing, desc)
+          if not isIgnored(data.ignore, desc.bundleID, desc.title) then
+            table.insert(slots, { desc = desc })
           end
         end
       end
     end
+  end
+
+  assignWindows(slots, pool)
+
+  local missing = {}
+  for _, slot in ipairs(slots) do
+    if not slot.entry then table.insert(missing, slot.desc) end
   end
   return missing
 end
@@ -742,8 +790,15 @@ local function restoreCurrentConfig()
 
   -- 対象画面ごとの計画を作る（現在接続中の画面のみ）
   -- plan = { uuid, spaces(レイアウト配列), target(目標user数) }
+  -- pairs の列挙順は不定なので UUID 昇順に固定する。
+  -- 順序が変わると照合の消費順も変わり、復元結果が実行ごとにぶれる
+  local screenUUIDs = {}
+  for uuid in pairs(data.screens) do table.insert(screenUUIDs, uuid) end
+  table.sort(screenUUIDs)
+
   local screenPlans = {}
-  for uuid, screenData in pairs(data.screens) do
+  for _, uuid in ipairs(screenUUIDs) do
+    local screenData = data.screens[uuid]
     if hs.screen.find(uuid) then
       local spaces = screenData.spaces or {}
       local userCount = 0
@@ -816,8 +871,8 @@ local function restoreCurrentConfig()
   -- ② spaceMove.moveWindowToSpace で逐次・非同期に実行する。
   --    既に目的 Space に居るウィンドウはフレーム補正のみで、Space は切り替わらない。
   local function placeWindows(pool)
-    -- ① タスクリスト構築（pool.takeMatchingWindow の消費順を現状と同一に保つ）
-    local tasks = {}
+    -- ① 配置先（スロット）をレイアウト順に集める
+    local slots = {}
     -- 並べ替えのため、レイアウト上の何番目の Space に全画面化したかを控える
     local fsPlacements = {}
     for _, plan in ipairs(screenPlans) do
@@ -831,48 +886,55 @@ local function restoreCurrentConfig()
 
       for spIdx, sp in ipairs(plan.spaces) do
         if (sp.type or "user") == "fullscreen" then
-          -- フルスクリーンSpace: setFullScreen(true) タスク
           for _, desc in ipairs(sp.windows or {}) do
-            local entry, matchKind = takeMatchingWindow(desc, pool)
-            if entry then
-              table.insert(tasks, {
-                kind = "fullscreen",
-                win = entry.win, desc = desc,
-                actualTitle = entry.desc.title, matchKind = matchKind,
-                uuid = plan.uuid, spaceIdx = spIdx,
-              })
-            else
-              print(string.format("未配置 %s actualTitle=[] reason=[該当ウィンドウなし]",
-                descKeyLabel(desc)))
-            end
+            table.insert(slots, {
+              kind = "fullscreen", desc = desc, uuid = plan.uuid, spaceIdx = spIdx,
+            })
           end
         else
-          -- user Space: Space 移動タスク
           userIdx = userIdx + 1
           local sid = userSpaceIDs[userIdx]
-          if sid then
-            for _, desc in ipairs(sp.windows or {}) do
-              local entry, matchKind = takeMatchingWindow(desc, pool)
-              if entry then
-                table.insert(tasks, {
-                  kind = "space",
-                  win = entry.win, desc = desc,
-                  actualTitle = entry.desc.title, matchKind = matchKind,
-                  sid = sid, uuid = plan.uuid, userIdx = userIdx,
-                })
-              else
-                print(string.format("未配置 %s actualTitle=[] reason=[該当ウィンドウなし]",
-                  descKeyLabel(desc)))
-              end
-            end
-          else
-            -- 実 Space 数が YAML の user Space 数より少ない場合
-            for _, desc in ipairs(sp.windows or {}) do
-              print(string.format("未配置 %s actualTitle=[] reason=[対象Spaceなし (userSpace#%d)]",
-                descKeyLabel(desc), userIdx))
-            end
+          for _, desc in ipairs(sp.windows or {}) do
+            table.insert(slots, {
+              kind = "space", desc = desc, uuid = plan.uuid,
+              sid = sid, userIdx = userIdx,
+              -- 実 Space 数が YAML の user Space 数より少ないと sid が無い。
+              -- 置き場所が無いので照合対象からも外す
+              noSpace = (sid == nil),
+            })
           end
         end
+      end
+    end
+
+    -- ② ウィンドウを割り当てる。
+    -- 候補が少ない記述から先に確定させる。'.*' のように広く当たるパターンを
+    -- 先に処理すると、特定のウィンドウを名指しする記述の取り分を奪ってしまう。
+    assignWindows(slots, pool)
+
+    -- ③ レイアウト順にタスク化する
+    local tasks = {}
+    for _, slot in ipairs(slots) do
+      if slot.noSpace then
+        print(string.format("未配置 %s actualTitle=[] reason=[対象Spaceなし (userSpace#%d)]",
+          descKeyLabel(slot.desc), slot.userIdx))
+      elseif not slot.entry then
+        print(string.format("未配置 %s actualTitle=[] reason=[該当ウィンドウなし]",
+          descKeyLabel(slot.desc)))
+      elseif slot.kind == "fullscreen" then
+        table.insert(tasks, {
+          kind = "fullscreen",
+          win = slot.entry.win, desc = slot.desc,
+          actualTitle = slot.entry.desc.title, matchKind = slot.matchKind,
+          uuid = slot.uuid, spaceIdx = slot.spaceIdx,
+        })
+      else
+        table.insert(tasks, {
+          kind = "space",
+          win = slot.entry.win, desc = slot.desc,
+          actualTitle = slot.entry.desc.title, matchKind = slot.matchKind,
+          sid = slot.sid, uuid = slot.uuid, userIdx = slot.userIdx,
+        })
       end
     end
 
@@ -914,7 +976,7 @@ local function restoreCurrentConfig()
       step(1)
     end
 
-    -- ② タスクを逐次・非同期で実行（ドラッグ方式に落ちる場合があるので1件ずつ待つ）
+    -- ④ タスクを逐次・非同期で実行（ドラッグ方式に落ちる場合があるので1件ずつ待つ）
     local function runTask(i)
       if i > #tasks then arrangeFullscreenOrder(); return end
       local t = tasks[i]
