@@ -13,9 +13,9 @@
     2. ドラッグ保持中に「操作スペースを左/右に移動」ショートカットを送出
     3. mouseUp 後、ウィンドウフレームを正確な位置に補正
 
-  ただしタイトルバーを自前で描くアプリ（Google Chrome など）では、
-  掴めてもウィンドウが Space の切替について来ない。純正 API も効かないため、
-  そうしたアプリは Space をまたいで移動できない。アプリ単位で連続失敗を数え、
+  把持点はウィンドウ上端の中央付近にとる。左端を掴むとリサイズ枠に当たり、
+  ウィンドウを横に伸縮させるだけで Space をまたげない。
+  それでも移動できないアプリに備え、アプリ単位で連続失敗を数え、
   規定回数に達したら以降そのアプリでは試さずフレーム補正だけ行う。
 
   参考: https://gist.github.com/xgungnir/a02f059b29adacaf7df884920e127533
@@ -50,8 +50,11 @@ local M = {}
 -- タイミング定数（Gist のタイミングを踏襲）
 -- ============================================================
 
-local TITLE_DX     = 5     -- タイトルバー把持点の x オフセット
-local TITLE_DY     = 18    -- 同 y オフセット（タイトルバー高さ相当）
+-- タイトルバーの把持点。ウィンドウ上端の中央付近を掴む。
+-- 左端 (x+5) はリサイズ枠に当たり、掴んだつもりで横に伸縮させるだけになる。
+-- y は Chrome で実測して 2〜6 が有効だった（y+1 はリサイズ枠、y+7 以降はタブ帯）。
+-- タブ帯を持つアプリでも、その直上に数 px の掴める帯がある。
+local GRAB_DY      = 4     -- タイトルバー把持点の y オフセット
 local GOTO_DELAY   = 0.5   -- gotoSpace 後、ウィンドウ把持までの待機（秒）
 local DOWN_DELAY   = 0.03  -- mouseDown 後（秒）
 local DRAG_DELAY   = 0.05  -- 1px ドラッグ確立後（秒）
@@ -347,7 +350,7 @@ local function dragWindowToSpace(win, targetSid, frame, hotkeys, done)
 
       -- タイトルバーをつかむ（mouseDown + 1px drag）
       local f   = win:frame()
-      local pt  = hs.geometry.point(f.x + TITLE_DX, f.y + TITLE_DY)
+      local pt  = hs.geometry.point(f.x + f.w / 2, f.y + GRAB_DY)
       local ptD = hs.geometry.point(pt.x + 1, pt.y)
 
       hs.mouse.absolutePosition(pt)
