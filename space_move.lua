@@ -13,8 +13,9 @@
     2. ドラッグ保持中に「操作スペースを左/右に移動」ショートカットを送出
     3. mouseUp 後、ウィンドウフレームを正確な位置に補正
 
-  把持点はウィンドウ上端の中央付近にとる。左端を掴むとリサイズ枠に当たり、
-  ウィンドウを横に伸縮させるだけで Space をまたげない。
+  把持点は固定オフセットでは決まらない。左端はリサイズ枠に当たり、水平中央は
+  Chrome のタブに当たる。どちらもウィンドウ本体をつかめない。そこで候補点を
+  アクセシビリティの当たり判定にかけ、ウィンドウ本体が返る点を選ぶ。
   それでも移動できないアプリに備え、アプリ単位で連続失敗を数え、
   規定回数に達したら以降そのアプリでは試さずフレーム補正だけ行う。
 
@@ -50,11 +51,17 @@ local M = {}
 -- タイミング定数（Gist のタイミングを踏襲）
 -- ============================================================
 
--- タイトルバーの把持点。ウィンドウ上端の中央付近を掴む。
+-- タイトルバーの把持点は固定できない（findGrabPoint で探索する）。
 -- 左端 (x+5) はリサイズ枠に当たり、掴んだつもりで横に伸縮させるだけになる。
--- y は Chrome で実測して 2〜6 が有効だった（y+1 はリサイズ枠、y+7 以降はタブ帯）。
--- タブ帯を持つアプリでも、その直上に数 px の掴める帯がある。
-local GRAB_DY      = 4     -- タイトルバー把持点の y オフセット
+-- 水平中央は Chrome のタブに当たる。Chrome のタブはウィンドウ上端 0px から
+-- タブ帯の全高を占めるので、タブの上には掴める余白がない。タブを 1px 動かしても
+-- Chrome はタブ操作として扱うため、Space だけが切り替わってウィンドウが取り残される。
+-- タブは 4〜5 枚を超えると水平中央まで届くので、中央固定は事実上ほぼ外れる。
+local GRAB_DY_LIST     = { 6, 10, 4, 14 } -- 把持点の y オフセット候補（浅い順に試す）
+local GRAB_EDGE_MIN    = 12  -- 左右端から最低これだけ離す（リサイズ枠と四隅の回避）
+local GRAB_HIT_TOL     = 8   -- AX 要素の矩形がウィンドウ矩形と一致すると見なす差（pt）
+local GRAB_DY_FALLBACK = 4   -- 候補が全滅したときに使う従来の y オフセット
+local RAISE_DELAY      = 0.05 -- raise 後、重なり順が落ち着くまでの待機（秒）
 local GOTO_DELAY   = 0.5   -- gotoSpace 後、ウィンドウ把持までの待機（秒）
 local DOWN_DELAY   = 0.03  -- mouseDown 後（秒）
 local DRAG_DELAY   = 0.05  -- 1px ドラッグ確立後（秒）
@@ -100,9 +107,8 @@ local SYMBOLIC_PLIST =
 -- nil=未判定 / true=動く / false=動かない。一度だけ実地に試して判定する。
 local nativeMoveWorks = nil
 
--- ドラッグ方式が使えるかはアプリごとに違う。
--- Chrome のようにタイトルバーを自前で描くアプリは、掴めてもウィンドウが
--- Space の切替について来ない（純正 API も効かないので移動手段が無い）。
+-- ドラッグ方式が使えるかはアプリごとに違う。掴める点が見つからないアプリや、
+-- 掴めてもウィンドウが Space の切替について来ないアプリがありうる。
 -- アプリ単位で連続失敗を数え、規定回数に達したらそのアプリでは以降試さない。
 -- 全体で1つのフラグにすると、1つのアプリの失敗で他のアプリまで諦めてしまう。
 local dragFailures = {}   -- bundleID -> 連続失敗回数
@@ -187,6 +193,58 @@ local function screenFrameOf(uuid)
   if not scr then return nil end
   local f = scr:frame()
   return { x = f.x, y = f.y, w = f.w, h = f.h }
+end
+
+-- ============================================================
+-- 把持点の探索
+-- ============================================================
+
+-- (x, y) でウィンドウ本体をつかめるかを AX の当たり判定で調べる。
+-- 判定はその点の最前面要素の矩形が f と一致するか。タブ・ボタン・ツールバー・
+-- タイトル文字列はいずれも自分自身の小さい矩形を返すので弾ける。
+-- 矩形が一致することは、その点を覆う別ウィンドウが無いことの確認にもなる。
+local function isGrabbable(x, y, f)
+  -- hs.axuielement は遅延ロードなので、参照自体を pcall の内側に置く
+  local ok, pos, size = pcall(function()
+    local el = hs.axuielement.systemElementAtPosition(x, y)
+    if not el then return nil, nil end
+    return el:attributeValue("AXPosition"), el:attributeValue("AXSize")
+  end)
+  if not ok or type(pos) ~= "table" or type(size) ~= "table" then return false end
+  return math.abs(pos.x - f.x) <= GRAB_HIT_TOL
+     and math.abs(pos.y - f.y) <= GRAB_HIT_TOL
+     and math.abs(size.w - f.w) <= GRAB_HIT_TOL
+     and math.abs(size.h - f.h) <= GRAB_HIT_TOL
+end
+
+-- win の上端付近で、ウィンドウ本体をつかめる点を探して返す（見つからなければ nil）。
+-- 探索対象の y は上端寄りに限る。深い位置はコンテンツ領域に入り、そこも
+-- ウィンドウと同じ矩形を返すアプリがあるため、掴めると誤判定してしまう。
+-- x は Chrome を通すために小さい値から試す。Chrome で空くのは信号ボタンの
+-- 上、タブ帯の左内側（左端から 86px ほど）だけで、そこから右は全てタブになる。
+local function findGrabPoint(win)
+  local f = win:frame()
+
+  local xs, seen = {}, {}
+  local function addX(v)
+    v = math.floor(v)
+    if v >= GRAB_EDGE_MIN and v <= f.w - GRAB_EDGE_MIN and not seen[v] then
+      seen[v] = true
+      xs[#xs + 1] = v
+    end
+  end
+  addX(60); addX(40)
+  addX(f.w / 2); addX(f.w * 0.75); addX(f.w * 0.25); addX(f.w - 60)
+  addX(100); addX(20)
+
+  for _, dy in ipairs(GRAB_DY_LIST) do
+    for _, dx in ipairs(xs) do
+      if isGrabbable(f.x + dx, f.y + dy, f) then
+        return hs.geometry.point(f.x + dx, f.y + dy), dx, dy
+      end
+    end
+  end
+  return nil
 end
 
 -- ============================================================
@@ -347,10 +405,19 @@ local function dragWindowToSpace(win, targetSid, frame, hotkeys, done)
     pcall(hs.spaces.gotoSpace, curSid)
     later(GOTO_DELAY, function()
       pcall(function() win:raise() end)
+      -- raise の反映を待つ。重なり順が古いままだと当たり判定が別ウィンドウを拾う
+      hs.timer.usleep(math.floor(RAISE_DELAY * 1000000))
 
-      -- タイトルバーをつかむ（mouseDown + 1px drag）
-      local f   = win:frame()
-      local pt  = hs.geometry.point(f.x + f.w / 2, f.y + GRAB_DY)
+      -- タイトルバーの掴める点を探してつかむ（mouseDown + 1px drag）
+      local f = win:frame()
+      local pt, gdx, gdy = findGrabPoint(win)
+      if not pt then
+        gdx, gdy = math.floor(f.w / 2), GRAB_DY_FALLBACK
+        pt = hs.geometry.point(f.x + gdx, f.y + gdy)
+        print(string.format(
+          "SpaceSaver(space_move): %s に掴める点が見つかりません。中央 (+%d,+%d) で試します",
+          bundleIDOf(win), gdx, gdy))
+      end
       local ptD = hs.geometry.point(pt.x + 1, pt.y)
 
       hs.mouse.absolutePosition(pt)
@@ -382,7 +449,8 @@ local function dragWindowToSpace(win, targetSid, frame, hotkeys, done)
                   dragFailures[bundleIDOf(win)] = 0
                   finish("drag")
                 else
-                  noteDragFailure(win, "Space の切替について来ない")
+                  noteDragFailure(win, string.format(
+                    "Space の切替について来ない, 把持点=+%d,+%d", gdx, gdy))
                   finish("failed")
                 end
               end)
