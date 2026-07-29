@@ -164,6 +164,24 @@ local function indexOf(tbl, val)
   return nil
 end
 
+-- sid がフルスクリーンの Space かどうか。判定できないときは false 扱い
+local function isFullScreenSpace(sid)
+  local ok, t = pcall(hs.spaces.spaceType, sid)
+  return ok and t == "fullscreen"
+end
+
+-- ドラッグ中に「操作スペースを左/右に移動」を何回送れば fromIdx から toIdx へ届くか。
+-- ドラッグ中のウィンドウはフルスクリーンの Space に置けないため、macOS はそこを
+-- 飛ばして次へ進める。全 Space で段数を数えると、間に挟まったフルスクリーンのぶん
+-- だけ行き過ぎる（両端が端の Space なら頭打ちで気づけないが、途中なら位置がずれる）
+local function stepsBetween(spaces, fromIdx, toIdx)
+  local step, n = (toIdx > fromIdx) and 1 or -1, 0
+  for i = fromIdx + step, toIdx, step do
+    if not isFullScreenSpace(spaces[i]) then n = n + 1 end
+  end
+  return n
+end
+
 -- win が属する Space ID の配列を返す（取得失敗時は空配列）
 local function windowSpacesOf(win)
   local ok, r = pcall(hs.spaces.windowSpaces, win)
@@ -485,8 +503,8 @@ local function dragWindowToSpace(win, targetSid, frame, hotkeys, done)
 
   -- ドラッグ本体（curIdx / targetIdx 確定後）
   local function performDrag(curSid, curIdx)
-    local steps = math.abs(targetIdx - curIdx)
     local dir   = targetIdx > curIdx and "right" or "left"
+    local steps = stepsBetween(allSpaces, curIdx, targetIdx)
     if not hk[dir] then
       print(string.format(
         "SpaceSaver(space_move): 「操作スペースを%sに移動」のショートカットが未設定のため移動できない",
