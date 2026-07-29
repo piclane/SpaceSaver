@@ -9,15 +9,20 @@
   判定結果はセッション内で保持し、2件目以降は検算を省く。
 
   ドラッグ方式:
-    1. ウィンドウのタイトルバーをマウスでつかむ（leftMouseDown + 1px drag）
-    2. ドラッグ保持中に「操作スペースを左/右に移動」ショートカットを送出
-    3. mouseUp 後、ウィンドウフレームを正確な位置に補正
+    1. ウィンドウをアプリごと前面に出す（focus）
+    2. タイトルバーの候補点を掴み、数 px 動かして本当に掴めたか確かめる
+    3. 掴んだまま「操作スペースを左/右に移動」ショートカットを送出
+    4. mouseUp 後、ウィンドウフレームを正確な位置に補正
 
   把持点は固定オフセットでは決まらない。左端はリサイズ枠に当たり、水平中央は
-  Chrome のタブに当たる。どちらもウィンドウ本体をつかめない。そこで候補点を
-  アクセシビリティの当たり判定にかけ、ウィンドウ本体が返る点を選ぶ。
-  それでも移動できないアプリに備え、アプリ単位で連続失敗を数え、
-  規定回数に達したら以降そのアプリでは試さずフレーム補正だけ行う。
+  Chrome のタブに当たる。そこで信号ボタン（閉じる・最小化・全画面）の実測位置を
+  基準に候補点を組み立てる。ボタンの真上・隙間・左右はタイトルバーの造りが
+  アプリごとに違っても掴める見込みが高く、ボタン自体を押す危険もない。
+
+  掴めたかどうかは当たり判定では決められない。ウィンドウと同じ矩形を返しながら
+  掴めない点もあれば、別の矩形を返しながら掴める点もある。実際に数 px 動かして
+  ウィンドウが追随したかで判定する。位置が変わらず大きさだけ変わったときは
+  リサイズ枠を掴んでいるので、掴めなかったものとして次の候補へ移る。
 
   参考: https://gist.github.com/xgungnir/a02f059b29adacaf7df884920e127533
 
@@ -51,25 +56,31 @@ local M = {}
 -- タイミング定数（Gist のタイミングを踏襲）
 -- ============================================================
 
--- タイトルバーの把持点は固定できない（findGrabPoint で探索する）。
+-- タイトルバーの把持点は固定できない（grabCandidates で候補を組み立てる）。
 -- 左端 (x+5) はリサイズ枠に当たり、掴んだつもりで横に伸縮させるだけになる。
 -- 水平中央は Chrome のタブに当たる。Chrome のタブはウィンドウ上端 0px から
 -- タブ帯の全高を占めるので、タブの上には掴める余白がない。タブを 1px 動かしても
 -- Chrome はタブ操作として扱うため、Space だけが切り替わってウィンドウが取り残される。
 -- タブは 4〜5 枚を超えると水平中央まで届くので、中央固定は事実上ほぼ外れる。
-local GRAB_DY_LIST     = { 6, 10, 4, 14 } -- 把持点の y オフセット候補（浅い順に試す）
-local GRAB_EDGE_MIN    = 12  -- 左右端から最低これだけ離す（リサイズ枠と四隅の回避）
-local GRAB_HIT_TOL     = 8   -- AX 要素の矩形がウィンドウ矩形と一致すると見なす差（pt）
-local GRAB_DY_FALLBACK = 4   -- 候補が全滅したときに使う従来の y オフセット
-local RAISE_DELAY      = 0.05 -- raise 後、重なり順が落ち着くまでの待機（秒）
+local GRAB_EDGE_MIN  = 5    -- 左右端・下端から最低これだけ離す（リサイズ枠の回避）
+local GRAB_TOP_MIN   = 3    -- 上端から最低これだけ下げる（同上）
+local AX_PARENT_MAX  = 12   -- AXWindow の祖先を辿る深さの上限
+local PROBE_DX       = 12   -- 掴めたか確かめるための試行ドラッグ量（px）
+local PROBE_MIN      = 3    -- これだけ動いたら掴めたと見なす（px）
+local PROBE_STEP     = 0.03 -- 試行ドラッグの各段の間隔（秒）
+local PROBE_SETTLE   = 0.06 -- 試行ドラッグ後、フレームを読むまでの待機（秒）
+local PROBE_RELEASE  = 0.05 -- 掴めなかった候補を放してから次を試すまで（秒）
+local FOCUS_DELAY    = 0.25 -- focus 後、前面化が反映されるまでの待機（秒）
+local FOCUS_RETRY    = 2    -- 前面化を確認できないときの再試行回数
 local GOTO_DELAY   = 0.5   -- gotoSpace 後、ウィンドウ把持までの待機（秒）
 local DOWN_DELAY   = 0.03  -- mouseDown 後（秒）
-local DRAG_DELAY   = 0.05  -- 1px ドラッグ確立後（秒）
+local DRAG_DELAY   = 0.05  -- 把持確立後、ショートカット送出まで（秒）
 local KEY_DELAY    = 0.6   -- 各ショートカット送出後（Space 切替アニメ待ち）（秒）
 local KEY_HOLD     = 0.03  -- keyDown から keyUp まで（秒）
 local DROP_DELAY   = 0.1   -- mouseUp 後、フレーム復元まで（秒）
 local VERIFY_DELAY = 0.2   -- 純正 API 実行後、windowSpaces を検算するまで（秒）
 local TIMEOUT_BASE = 3.0   -- 安全タイムアウトの固定分（秒）。可変分は Space 移動段数に比例
+local PROBE_BUDGET = 6.0   -- 把持点の探索に充てる上限（秒）。安全タイムアウトの計算に使う
 
 -- フルスクリーン切替はアニメーションを伴うため、各段で収まるのを待つ
 local FS_EXIT_DELAY  = 1.2  -- フルスクリーン解除後（秒）
@@ -114,6 +125,9 @@ local nativeMoveWorks = nil
 local dragFailures = {}   -- bundleID -> 連続失敗回数
 local dragBlocked  = {}   -- bundleID -> true なら以降ドラッグを試さない
 local DRAG_GIVEUP  = 3    -- 同じアプリでも成否が揺れることがあるので少し余裕を持たせる
+
+-- 掴めた点はアプリ内で共通なので、bundleID ごとに覚えて次から最初に試す
+local grabPoints = {}     -- bundleID -> { dx = 数値, dy = 数値 }
 
 -- OS 設定から読んだショートカット（セッション内キャッシュ）
 local systemHotkeys = nil
@@ -199,52 +213,139 @@ end
 -- 把持点の探索
 -- ============================================================
 
--- (x, y) でウィンドウ本体をつかめるかを AX の当たり判定で調べる。
--- 判定はその点の最前面要素の矩形が f と一致するか。タブ・ボタン・ツールバー・
--- タイトル文字列はいずれも自分自身の小さい矩形を返すので弾ける。
--- 矩形が一致することは、その点を覆う別ウィンドウが無いことの確認にもなる。
-local function isGrabbable(x, y, f)
+-- 押すとウィンドウが閉じたり、ファイルのドラッグが始まってしまう要素。
+-- 候補は信号ボタンを避けて組み立てるが、造りの違うアプリのための二重の歯止め
+local NON_GRABBABLE_ROLE = {
+  AXButton    = true, AXMenuButton = true, AXPopUpButton = true,
+  AXRadioButton = true, AXCheckBox = true, AXSlider    = true,
+  AXTextField = true, AXTextArea   = true, AXLink      = true,
+  AXTab       = true, AXTabGroup   = true, AXIncrementor = true,
+  AXImage     = true, -- プロキシアイコン。掴むと書類のドラッグが始まる
+}
+
+-- (x, y) の最前面要素が win 自身のものかを、AXWindow の祖先まで辿って ID で確かめる。
+-- 矩形の一致で見ると、同じ大きさに広げた別ウィンドウが重なったときに自分だと誤認する。
+-- 誤認したまま掴むと、覆っている側のウィンドウが Space を渡っていき、対象は残される。
+-- 戻り値: 自分のものか, その点の要素のロール
+local function hitOwnedBy(win, x, y)
   -- hs.axuielement は遅延ロードなので、参照自体を pcall の内側に置く
-  local ok, pos, size = pcall(function()
+  local ok, owned, role = pcall(function()
     local el = hs.axuielement.systemElementAtPosition(x, y)
-    if not el then return nil, nil end
-    return el:attributeValue("AXPosition"), el:attributeValue("AXSize")
+    if not el then return false, nil end
+    local hitRole = el:attributeValue("AXRole")
+    local cur, depth = el, 0
+    while cur and depth <= AX_PARENT_MAX do
+      if cur:attributeValue("AXRole") == "AXWindow" then
+        local w = cur:asHSWindow()
+        return (w ~= nil and w:id() == win:id()), hitRole
+      end
+      cur   = cur:attributeValue("AXParent")
+      depth = depth + 1
+    end
+    return false, hitRole
   end)
-  if not ok or type(pos) ~= "table" or type(size) ~= "table" then return false end
-  return math.abs(pos.x - f.x) <= GRAB_HIT_TOL
-     and math.abs(pos.y - f.y) <= GRAB_HIT_TOL
-     and math.abs(size.w - f.w) <= GRAB_HIT_TOL
-     and math.abs(size.h - f.h) <= GRAB_HIT_TOL
+  if not ok then return false, nil end
+  return owned, role
 end
 
--- win の上端付近で、ウィンドウ本体をつかめる点を探して返す（見つからなければ nil）。
--- 探索対象の y は上端寄りに限る。深い位置はコンテンツ領域に入り、そこも
--- ウィンドウと同じ矩形を返すアプリがあるため、掴めると誤判定してしまう。
--- x は Chrome を通すために小さい値から試す。Chrome で空くのは信号ボタンの
--- 上、タブ帯の左内側（左端から 86px ほど）だけで、そこから右は全てタブになる。
-local function findGrabPoint(win)
-  local f = win:frame()
-
-  local xs, seen = {}, {}
-  local function addX(v)
-    v = math.floor(v)
-    if v >= GRAB_EDGE_MIN and v <= f.w - GRAB_EDGE_MIN and not seen[v] then
-      seen[v] = true
-      xs[#xs + 1] = v
-    end
-  end
-  addX(60); addX(40)
-  addX(f.w / 2); addX(f.w * 0.75); addX(f.w * 0.25); addX(f.w - 60)
-  addX(100); addX(20)
-
-  for _, dy in ipairs(GRAB_DY_LIST) do
-    for _, dx in ipairs(xs) do
-      if isGrabbable(f.x + dx, f.y + dy, f) then
-        return hs.geometry.point(f.x + dx, f.y + dy), dx, dy
+-- 信号ボタン（閉じる・最小化・全画面）の矩形をウィンドウ相対で返す。
+-- AXWindow の標準属性なので、タイトルバーを自前で描くアプリでも取れる
+local function trafficLights(win)
+  local out = {}
+  pcall(function()
+    local axw = hs.axuielement.windowElement(win)
+    if not axw then return end
+    local f = win:frame()
+    for key, attr in pairs({ close = "AXCloseButton",
+                             mini  = "AXMinimizeButton",
+                             zoom  = "AXZoomButton" }) do
+      local el  = axw:attributeValue(attr)
+      local pos = el and el:attributeValue("AXPosition")
+      local sz  = el and el:attributeValue("AXSize")
+      if type(pos) == "table" and type(sz) == "table" then
+        out[key] = { x = pos.x - f.x, y = pos.y - f.y, w = sz.w, h = sz.h }
       end
     end
+  end)
+  return out
+end
+
+-- 掴める見込みの高い順に候補点（ウィンドウ相対のオフセット）を並べて返す。
+-- 信号ボタンの位置を基準にすると、タイトルバーの高さや造りがアプリごとに違っても
+-- ボタンを外した位置を選べる。いずれもタブ帯が始まるより左なので、
+-- Chrome のようにタブが上端いっぱいを占めるアプリでもタブを掴まずに済む。
+local function grabCandidates(win)
+  local f = win:frame()
+  local list, seen = {}, {}
+  local function add(dx, dy)
+    dx, dy = math.floor(dx), math.floor(dy)
+    local key = dx .. "," .. dy
+    if not seen[key]
+       and dx >= GRAB_EDGE_MIN and dx <= f.w - GRAB_EDGE_MIN
+       and dy >= GRAB_TOP_MIN  and dy <= f.h - GRAB_EDGE_MIN then
+      seen[key] = true
+      list[#list + 1] = { dx = dx, dy = dy }
+    end
   end
-  return nil
+
+  -- 同じアプリで前回掴めた点を最優先で試す
+  local cached = grabPoints[bundleIDOf(win)]
+  if cached then add(cached.dx, cached.dy) end
+
+  local b = trafficLights(win)
+  if b.close then
+    local rightmost = b.zoom or b.mini or b.close
+    local rightX    = rightmost.x + rightmost.w
+    local aboveY    = math.max(GRAB_TOP_MIN, math.floor(b.close.y / 2))
+    local midY      = b.close.y + b.close.h / 2
+    local belowY    = b.close.y + b.close.h + 3
+
+    -- ボタンの真上。ボタン自体とウィンドウ上端の間で、たいていウィンドウ本体
+    add(b.close.x + b.close.w / 2, aboveY)
+    if b.mini then add(b.mini.x + b.mini.w / 2, aboveY) end
+    if b.zoom then add(b.zoom.x + b.zoom.w / 2, aboveY) end
+    -- ボタンとボタンの隙間
+    if b.mini then add((b.close.x + b.close.w + b.mini.x) / 2, midY) end
+    if b.mini and b.zoom then add((b.mini.x + b.mini.w + b.zoom.x) / 2, midY) end
+    -- ボタン群の右。タブ帯やツールバーが始まるより手前
+    add(rightX + 8,  midY)
+    add(rightX + 8,  aboveY)
+    add(rightX + 20, midY)
+    -- ボタン群の左と下
+    add(b.close.x / 2, midY)
+    add(b.close.x + b.close.w / 2, belowY)
+  end
+
+  -- 信号ボタンを持たないウィンドウ向けの保険
+  for _, dy in ipairs({ 6, 12, 20 }) do
+    add(60, dy); add(40, dy); add(100, dy)
+  end
+  add(f.w / 2, 6)
+  add(f.w * 0.75, 6)
+
+  return list
+end
+
+-- ============================================================
+-- 前面化
+-- ============================================================
+
+-- ウィンドウをアプリごと前面に出してから cb を呼ぶ。
+-- win:raise() はアプリをまたぐ重なり順を変えないため、別アプリのウィンドウに
+-- 覆われたままになる。覆われた状態で掴むと、当たり判定も実際のクリックも
+-- 覆っている側に吸われる。focus() はアプリを activate するので前面に出る。
+local function bringToFront(win, attempt, cb)
+  pcall(function() win:focus() end)
+  later(FOCUS_DELAY, function()
+    local ok, front = pcall(hs.window.frontmostWindow)
+    if ok and front and front:id() == win:id() then cb(); return end
+    if attempt < FOCUS_RETRY then
+      bringToFront(win, attempt + 1, cb)
+    else
+      -- 前面化を確認できなくても、候補ごとの所有チェックが誤爆を防ぐ
+      cb()
+    end
+  end)
 end
 
 -- ============================================================
@@ -395,30 +496,79 @@ local function dragWindowToSpace(win, targetSid, frame, hotkeys, done)
 
     -- フェイルセーフ: 想定所要時間を超えたら強制完了（復元全体が止まらないよう）
     timeoutTimer = later(
-      TIMEOUT_BASE + GOTO_DELAY + steps * (KEY_DELAY + KEY_HOLD),
+      TIMEOUT_BASE + GOTO_DELAY + PROBE_BUDGET + steps * (KEY_DELAY + KEY_HOLD),
       function()
         noteDragFailure(win, "タイムアウト")
         finish("failed")
       end)
 
-    -- 現在 Space に移動してウィンドウを最前面化
-    pcall(hs.spaces.gotoSpace, curSid)
-    later(GOTO_DELAY, function()
-      pcall(function() win:raise() end)
-      -- raise の反映を待つ。重なり順が古いままだと当たり判定が別ウィンドウを拾う
-      hs.timer.usleep(math.floor(RAISE_DELAY * 1000000))
+    -- 掴んだまま Space を渡り、放してフレームを補正する
+    local function crossSpaces(gdx, gdy)
+      local function sendKey(n)
+        if n > steps then
+          hs.eventtap.event.newMouseEvent(
+            hs.eventtap.event.types.leftMouseUp,
+            hs.mouse.absolutePosition()):post()
+          mouseIsDown = false
 
-      -- タイトルバーの掴める点を探してつかむ（mouseDown + 1px drag）
-      local f = win:frame()
-      local pt, gdx, gdy = findGrabPoint(win)
-      if not pt then
-        gdx, gdy = math.floor(f.w / 2), GRAB_DY_FALLBACK
-        pt = hs.geometry.point(f.x + gdx, f.y + gdy)
-        print(string.format(
-          "SpaceSaver(space_move): %s に掴める点が見つかりません。中央 (+%d,+%d) で試します",
-          bundleIDOf(win), gdx, gdy))
+          later(DROP_DELAY, function()
+            applyFrame(win, frame)
+            -- 掴めていても、ウィンドウが Space の切替について来ないアプリがある。
+            -- 実際に移れたか検算する
+            if indexOf(windowSpacesOf(win), targetSid) then
+              dragFailures[bundleIDOf(win)] = 0
+              finish("drag")
+            else
+              noteDragFailure(win, string.format(
+                "Space の切替について来ない, 把持点=+%d,+%d", gdx, gdy))
+              finish("failed")
+            end
+          end)
+          return
+        end
+        -- ドラッグ保持中にショートカット送出（1 Space ずつ移動）
+        postHotkey(hk[dir])
+        later(KEY_DELAY, function() sendKey(n + 1) end)
       end
-      local ptD = hs.geometry.point(pt.x + 1, pt.y)
+
+      sendKey(1)
+    end
+
+    -- マウスボタンを押したまま anchor から dx だけ動かす。
+    -- 1 発だと動き出さないアプリがあるので段階的に送る
+    local function dragBy(anchor, dx)
+      local prev = 0
+      for _, offset in ipairs({ 1, math.floor(dx / 2), dx }) do
+        if offset > prev then
+          hs.eventtap.event.newMouseEvent(
+            hs.eventtap.event.types.leftMouseDragged,
+            hs.geometry.point(anchor.x + offset, anchor.y))
+            :setProperty(hs.eventtap.event.properties.mouseEventDeltaX, offset - prev)
+            :post()
+          hs.timer.usleep(math.floor(PROBE_STEP * 1000000))
+          prev = offset
+        end
+      end
+    end
+
+    -- 候補を順に掴んでみる。掴めたらそのまま Space の移動へ進む
+    local cands = {}
+
+    local function tryCandidate(i)
+      local c = cands[i]
+      if not c then
+        noteDragFailure(win, string.format("掴める点が見つからない, 候補=%d件", #cands))
+        finish("failed"); return
+      end
+
+      local f0 = win:frame()
+      local pt = hs.geometry.point(f0.x + c.dx, f0.y + c.dy)
+
+      -- 別ウィンドウに覆われている点と、押してはいけない要素は掴まずに飛ばす
+      local owned, role = hitOwnedBy(win, pt.x, pt.y)
+      if not owned or (role and NON_GRABBABLE_ROLE[role]) then
+        tryCandidate(i + 1); return
+      end
 
       hs.mouse.absolutePosition(pt)
       hs.eventtap.event.newMouseEvent(
@@ -426,43 +576,47 @@ local function dragWindowToSpace(win, targetSid, frame, hotkeys, done)
       mouseIsDown = true
 
       later(DOWN_DELAY, function()
-        -- 1px ドラッグでウィンドウをつかんでいる状態を OS に認識させる
-        hs.eventtap.event.newMouseEvent(
-          hs.eventtap.event.types.leftMouseDragged, ptD)
-          :setProperty(hs.eventtap.event.properties.mouseEventDeltaX, 1)
-          :post()
+        dragBy(pt, PROBE_DX)
 
-        later(DRAG_DELAY, function()
-          local function sendKey(n)
-            if n > steps then
-              -- マウスを放す → フレーム復元
-              hs.eventtap.event.newMouseEvent(
-                hs.eventtap.event.types.leftMouseUp,
-                hs.mouse.absolutePosition()):post()
-              mouseIsDown = false
+        later(PROBE_SETTLE, function()
+          local f1 = win:frame()
+          local moved   = math.abs(f1.x - f0.x) + math.abs(f1.y - f0.y)
+          local resized = math.abs(f1.w - f0.w) + math.abs(f1.h - f0.h)
 
-              later(DROP_DELAY, function()
-                applyFrame(win, frame)
-                -- 合成マウスイベントでウィンドウを掴めていないと、
-                -- Space だけが切り替わって取り残される。実際に移れたか検算する
-                if indexOf(windowSpacesOf(win), targetSid) then
-                  dragFailures[bundleIDOf(win)] = 0
-                  finish("drag")
-                else
-                  noteDragFailure(win, string.format(
-                    "Space の切替について来ない, 把持点=+%d,+%d", gdx, gdy))
-                  finish("failed")
-                end
-              end)
-              return
-            end
-            -- ドラッグ保持中にショートカット送出（1 Space ずつ移動）
-            postHotkey(hk[dir])
-            later(KEY_DELAY, function() sendKey(n + 1) end)
+          -- 掴んだ位置へ戻す。掴めていれば元の位置に、
+          -- リサイズ枠を掴んでいれば元の大きさに戻る
+          hs.eventtap.event.newMouseEvent(
+            hs.eventtap.event.types.leftMouseDragged, pt)
+            :setProperty(hs.eventtap.event.properties.mouseEventDeltaX, -PROBE_DX)
+            :post()
+          hs.timer.usleep(math.floor(PROBE_STEP * 1000000))
+
+          -- 位置が変わらなければ掴めていない。大きさが変わったならリサイズ枠
+          if moved >= PROBE_MIN and resized <= 1 then
+            grabPoints[bundleIDOf(win)] = { dx = c.dx, dy = c.dy }
+            later(DRAG_DELAY, function() crossSpaces(c.dx, c.dy) end)
+            return
           end
 
-          sendKey(1)
+          hs.eventtap.event.newMouseEvent(
+            hs.eventtap.event.types.leftMouseUp, pt):post()
+          mouseIsDown = false
+          later(PROBE_RELEASE, function()
+            -- リサイズ枠を掴んでいた場合に備えて大きさを戻す
+            if resized > 0 then applyFrame(win, f0) end
+            tryCandidate(i + 1)
+          end)
         end)
+      end)
+    end
+
+    -- 現在 Space に移動し、ウィンドウを本当に前面へ出してから掴む。
+    -- 候補は前面化のあとで組み立てる（位置と信号ボタンの配置が確定してから読む）
+    pcall(hs.spaces.gotoSpace, curSid)
+    later(GOTO_DELAY, function()
+      bringToFront(win, 1, function()
+        cands = grabCandidates(win)
+        tryCandidate(1)
       end)
     end)
   end
