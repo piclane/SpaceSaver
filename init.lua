@@ -92,13 +92,15 @@ obj.dataDir  = hs.configdir
 --   }
 obj.spaceSwitchHotkeys = nil
 
--- 照合できないウィンドウがあったとき、全 Space を巡回して取り直すか。
--- 通常は hs.window.filter が非可視 Space のウィンドウも保持しているため巡回は不要で、
--- 既定では巡回しない（有効にすると Space 数だけ画面が切り替わり数十秒かかる）。
--- Hammerspoon をリロードした直後は filter のキャッシュが揃っておらず、
--- 同一アプリの2枚目以降のウィンドウを取りこぼすことがある。
--- そこまで確実に復元したい場合のみ true にする。
-obj.rescanSpacesIfIncomplete = false
+-- 照合できないウィンドウがあったとき、その Space を表示して拾い直すか。
+-- macOS は非可視 Space のウィンドウを AX に出さない。通常は hs.window.filter が
+-- 一度見たウィンドウを保持し続けるので表示せずに済むが、Hammerspoon の起動・リロード
+-- 直後はそのキャッシュが空で、別 Space に置かれたウィンドウを取りこぼす。
+-- 埋めるには対象 Space を一度表示するしかない。
+-- アクティブな Space と表示済みの Space は飛ばし、照合できない記述が無くなれば
+-- 打ち切るので、実際に切り替わるのは起動後の初回だけで済む。
+-- 復元中に一切画面を切り替えたくない場合は false にする。
+obj.rescanSpacesIfIncomplete = true
 
 -- フルスクリーン Space をレイアウトどおりの位置へ並べ替えるか。
 -- Mission Control を開いてサムネイルをドラッグするため、
@@ -141,6 +143,11 @@ local screenWatcher    = nil
 local screenTimer      = nil
 local menubar          = nil
 local windowFilter     = nil   -- 非可視Spaceも含むウィンドウ列挙用（遅延生成）
+
+-- 取りこぼしを埋めるために表示した Space の記録（sid -> true）。
+-- hs.window.filter は一度見たウィンドウを非可視 Space に移っても保持し続けるため、
+-- 同じ Space を同一セッション内で二度表示しても新しい発見はない。
+local rescannedSpaces  = {}
 
 -- ============================================================
 -- ユーティリティ
@@ -1062,15 +1069,59 @@ local function restoreCurrentConfig()
     runTask(1)
   end
 
-  -- 全 Space を巡回してウィンドウプールを取り直す（フォールバック）。
-  -- hs.window.filter のキャッシュが不完全だったときだけ通る経路。
+  -- 照合できなかった記述のために、Space を表示してウィンドウを拾い直す。
+  -- macOS は非可視 Space のウィンドウを AX に出さないため、その Space を表示するまで
+  -- hs.window.get は nil を返す。表示する以外に取得する手段がない。
+  -- 全 Space を舐めると画面が何度も切り替わるので、次の3点で回数を抑える。
+  --   1. アクティブな Space は既にプールへ入っているので飛ばす
+  --   2. 同一セッションで表示済みの Space は飛ばす（filter が保持し続けている）
+  --   3. 照合できない記述が無くなった時点で打ち切る
+  -- 3 が早く効くよう、照合できない記述を置くモニタの Space から先に見る。
   local function rescanSpaces(pool, onDone)
-    local worklist = {}
-    for _, plan in ipairs(screenPlans) do
-      for _, sid in ipairs(hs.spaces.spacesForScreen(plan.uuid) or {}) do
-        table.insert(worklist, sid)
+    local unmet = missingButRunning(unmatchedDescriptors(pool, data))
+    if #unmet == 0 then onDone(pool); return end
+
+    -- 記述 -> それを置くモニタ。unmatchedDescriptors はレイアウト上の desc を
+    -- そのまま返すので、テーブルの同一性で引ける
+    local descScreen = {}
+    for uuid, screenData in pairs(data.screens) do
+      for _, sp in ipairs(screenData.spaces or {}) do
+        for _, d in ipairs(sp.windows or {}) do descScreen[d] = uuid end
       end
     end
+    local priority = {}
+    for _, desc in ipairs(unmet) do
+      local uuid = descScreen[desc]
+      if uuid then priority[uuid] = true end
+    end
+
+    local active = {}
+    for _, plan in ipairs(screenPlans) do
+      local ok, sid = pcall(hs.spaces.activeSpaceOnScreen, plan.uuid)
+      if ok and sid then active[sid] = true end
+    end
+
+    local worklist = {}
+    local function addSpacesOf(plan)
+      for _, sid in ipairs(hs.spaces.spacesForScreen(plan.uuid) or {}) do
+        if not active[sid] and not rescannedSpaces[sid] then
+          table.insert(worklist, sid)
+        end
+      end
+    end
+    for _, plan in ipairs(screenPlans) do
+      if priority[plan.uuid] then addSpacesOf(plan) end
+    end
+    for _, plan in ipairs(screenPlans) do
+      if not priority[plan.uuid] then addSpacesOf(plan) end
+    end
+
+    if #worklist == 0 then
+      print("SpaceSaver: 未表示の Space が無いため、これ以上ウィンドウを拾えません")
+      onDone(pool)
+      return
+    end
+    print(string.format("SpaceSaver: %d 件の Space を表示してウィンドウを拾い直します", #worklist))
 
     local seen = {}
     for _, e in ipairs(pool) do
@@ -1081,24 +1132,36 @@ local function restoreCurrentConfig()
     spacesTouched = true
     local function step(i)
       if i > #worklist then onDone(pool); return end
-      pcall(hs.spaces.gotoSpace, worklist[i])
+      local sid = worklist[i]
+      rescannedSpaces[sid] = true
+      pcall(hs.spaces.gotoSpace, sid)
       later(CAPTURE_SETTLE, function()
-        local wok, winIDs = pcall(hs.spaces.windowsForSpace, worklist[i])
+        local added = 0
+        local wok, winIDs = pcall(hs.spaces.windowsForSpace, sid)
         if wok and winIDs then
           for _, wid in ipairs(winIDs) do
             if not seen[wid] then
               seen[wid] = true
               local win = hs.window.get(wid)
               local entry = win and poolEntry(win, data.ignore)
-              if entry then table.insert(pool, entry) end
+              if entry then
+                table.insert(pool, entry)
+                added = added + 1
+              end
             end
           end
+        end
+        -- 拾えたときだけ再判定する。プールが変わっていなければ結果も変わらない
+        if added > 0 and #missingButRunning(unmatchedDescriptors(pool, data)) == 0 then
+          print(string.format("SpaceSaver: %d 件目で全ての記述が照合できたため巡回を打ち切ります", i))
+          onDone(pool)
+          return
         end
         step(i + 1)
       end)
     end
 
-    if #worklist == 0 then onDone(pool) else step(1) end
+    step(1)
   end
 
   -- Space を切り替えずにプールを組んで配置する。
@@ -1114,10 +1177,10 @@ local function restoreCurrentConfig()
         print("  " .. descKeyLabel(desc))
       end
       if obj.rescanSpacesIfIncomplete then
-        print("SpaceSaver: rescanSpacesIfIncomplete により全 Space を巡回して取り直します")
         rescanSpaces(pool, placeWindows)
         return
       end
+      print("SpaceSaver: rescanSpacesIfIncomplete を有効にすると Space を表示して拾い直します")
     end
 
     placeWindows(pool)
