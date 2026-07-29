@@ -9,6 +9,11 @@
   スキーマ:     Spoon バンドル内の space_layouts.schema.json
                 （保存YAMLの $schema には絶対パスを自動付与）
 
+  共通設定:     <dataDir>/space_common.yaml（kind: SpaceCommon、任意）
+                モニタ構成によらない設定を置く。現在のキーは ignore のみで、
+                各レイアウトファイルの ignore と連結して使う。
+                無くても従来どおり動く。スキーマは space_common.schema.json
+
   インストール:
     1. このフォルダを ~/.hammerspoon/Spoons/SpaceSaver.spoon/ に置く
     2. ~/.hammerspoon/init.lua に以下を追記:
@@ -59,7 +64,9 @@
     - 再キャプチャは既存エントリを引き継ぐ。title/titlePattern が一致するウィンドウは
       そのエントリのまま現在のSpaceへ移し、frameだけ更新する。
       一致しなかった既存エントリは元の位置に残る（ignoreに一致するものは削除）
-    - yq不在時はJSONフォールバック（space_layouts_<n>.json）で動作
+    - yq不在時はJSONフォールバック（space_layouts_<n>.json / space_common.json）で動作
+    - 共通ファイルの ignore は照合にだけ使い、レイアウトファイルには書き戻さない。
+      書き戻すと共通の規則が全レイアウトファイルに複製される
     - Spaceをまたぐ移動が必要なウィンドウはドラッグ方式で移動するため、
       その間だけマウスカーソルが動き、Spaceが切り替わる
       （hs.spaces.moveWindowToSpace は macOS 15 以降、成功を返しつつ移動しない）
@@ -117,6 +124,11 @@ local spaceOrder = dofile(hs.spoons.resourcePath("space_order.lua"))
 -- ============================================================
 
 local YQ_DEFAULT = "/opt/homebrew/bin/yq"
+
+-- 共通設定ファイルの名前（拡張子なし）。
+-- listConfigFiles の走査パターン "^space_layouts_.+" に掛からない名前にする。
+-- 掛かるとレイアウトファイルとして毎回読み込まれる
+local COMMON_BASENAME = "space_common"
 
 local SCREEN_SETTLE  = 2.0   -- 秒: モニター変化後、復元開始までのデバウンス
 local RESTORE_DELAY  = 1.0   -- 秒: Space追加/削除後、ウィンドウ移動までの待機
@@ -194,8 +206,8 @@ local function configExt()
   return yqBin() and "yaml" or "json"
 end
 
--- YAMLまたはJSONファイルを読み込んでデコードする（失敗時nil）
-local function loadConfigFile(path)
+-- YAMLまたはJSONファイルをデコードして返す（失敗時nil）。内容の検証はしない
+local function decodeConfigFile(path)
   local ext = path:match("%.([^%.]+)$")
   if ext == "yaml" then
     local yq = yqBin()
@@ -204,13 +216,7 @@ local function loadConfigFile(path)
       string.format("%s -o=json -p=yaml %s 2>/dev/null", sq(yq), sq(path)))
     if ok and out and out:match("%S") then
       local succ, data = pcall(hs.json.decode, out)
-      -- apiVersion / kind でフォーマット検証
-      if succ and type(data) == "table"
-         and data.apiVersion == "v1"
-         and data.kind == "SpaceLayouts"
-         and type(data.screens) == "table" then
-        return data
-      end
+      if succ and type(data) == "table" then return data end
     end
   elseif ext == "json" then
     local f = io.open(path, "r")
@@ -220,6 +226,61 @@ local function loadConfigFile(path)
     if ok and type(data) == "table" then return data end
   end
   return nil
+end
+
+-- レイアウトファイルを読み込む（失敗・書式違いは nil）
+local function loadConfigFile(path)
+  local data = decodeConfigFile(path)
+  if not data then return nil end
+  -- apiVersion / kind でフォーマット検証
+  if path:match("%.yaml$") then
+    if data.apiVersion == "v1" and data.kind == "SpaceLayouts"
+       and type(data.screens) == "table" then
+      return data
+    end
+    return nil
+  end
+  return data
+end
+
+-- 共通設定ファイルのパス（dataDir/space_common.{yaml|json}）
+local function commonConfigPath()
+  return obj.dataDir .. "/" .. COMMON_BASENAME .. "." .. configExt()
+end
+
+-- 共通設定ファイルの ignore を返す。
+-- ファイルが無ければ空リストを返し、従来どおりレイアウトファイルの ignore だけで動く。
+-- 書式が不正なときは、黙って無視すると原因が分からないのでログに残す
+local function loadCommonIgnore()
+  local path = commonConfigPath()
+  if not hs.fs.attributes(path) then return {} end
+
+  local data = decodeConfigFile(path)
+  if not data then
+    print("SpaceSaver: [" .. basename(path) .. "] を読めません")
+    return {}
+  end
+  if data.apiVersion ~= "v1" or data.kind ~= "SpaceCommon" then
+    print("SpaceSaver: [" .. basename(path) .. "] の apiVersion/kind が不正です"
+      .. "（apiVersion: v1 / kind: SpaceCommon）")
+    return {}
+  end
+  if data.ignore ~= nil and type(data.ignore) ~= "table" then
+    print("SpaceSaver: [" .. basename(path) .. "] の ignore が配列ではありません")
+    return {}
+  end
+  return data.ignore or {}
+end
+
+-- 共通の ignore とレイアウトファイル自身の ignore を連結して返す。
+-- isIgnored はいずれか1つに一致すれば無視するので、連結だけで両方が効く。
+-- 連結後のリストは照合にのみ使い、ファイルへは書き戻さない。書き戻すと
+-- 共通の規則が全レイアウトファイルに複製され、共通ファイルを直しても古い複製が残る
+local function effectiveIgnore(localRules)
+  local merged = {}
+  for _, rule in ipairs(loadCommonIgnore()) do merged[#merged + 1] = rule end
+  for _, rule in ipairs(localRules or {}) do merged[#merged + 1] = rule end
+  return merged
 end
 
 -- space_layouts_*.{yaml|json} のパス一覧をソートして返す
@@ -261,7 +322,12 @@ local function findConfigFile(set)
         if not set[uuid] then matched = false; break end
         n = n + 1
       end
-      if matched and n == setCount then return path, data end
+      if matched and n == setCount then
+        -- 照合に使う無視リストをここで1度だけ組み立てる。
+        -- data.ignore はファイル自身の分のまま残す（キャプチャの書き戻しに使う）
+        data.ignoreEffective = effectiveIgnore(data.ignore)
+        return path, data
+      end
     end
   end
   return nil, nil
@@ -640,7 +706,7 @@ local function unmatchedDescriptors(pool, data)
         for _, desc in ipairs(sp.windows or {}) do
           -- ignore に一致する記述は意図的に配置しないので、取りこぼしとして数えない
           -- （次のキャプチャで削除される）
-          if not isIgnored(data.ignore, desc.bundleID, desc.title) then
+          if not isIgnored(data.ignoreEffective, desc.bundleID, desc.title) then
             table.insert(slots, { desc = desc })
           end
         end
@@ -701,7 +767,10 @@ function obj:capture()
 
   -- 無視リストと、既存エントリの再利用プールを用意する。
   -- leftover は実ウィンドウと照合するたびに消費され、残ったものは finish() で元の位置に戻す。
-  local ignoreRules = existingData and existingData.ignore or nil
+  -- 照合には共通ファイルを含めた ignoreRules を使い、書き戻すのは localIgnore だけにする
+  local localIgnore = existingData and existingData.ignore or nil
+  local ignoreRules = (existingData and existingData.ignoreEffective)
+                      or effectiveIgnore(nil)
   local leftover    = collectExistingEntries(existingData)
 
   -- 現在のアクティブSpaceを記録（キャプチャ後に戻すため）
@@ -770,7 +839,7 @@ function obj:capture()
           "SpaceSaver: 該当ウィンドウのない既存エントリ 保持=%d 削除=%d", kept, dropped))
       end
 
-      saveConfigFile(path, newScreens, ignoreRules)
+      saveConfigFile(path, newScreens, localIgnore)
       busy = false
       hs.alert.show("SpaceSaver: キャプチャ完了 [" .. basename(path) .. "]")
       if updateMenu then updateMenu() end
@@ -1143,7 +1212,7 @@ local function restoreCurrentConfig()
             if not seen[wid] then
               seen[wid] = true
               local win = hs.window.get(wid)
-              local entry = win and poolEntry(win, data.ignore)
+              local entry = win and poolEntry(win, data.ignoreEffective)
               if entry then
                 table.insert(pool, entry)
                 added = added + 1
@@ -1168,7 +1237,7 @@ local function restoreCurrentConfig()
   -- アプリが起動中なのに照合できなかった記述は、ウィンドウ列挙の取りこぼしか
   -- レイアウトの記述ずれのどちらかなので、判断材料としてログに出す。
   local function buildPoolAndPlace()
-    local pool     = buildPool(data.ignore)
+    local pool     = buildPool(data.ignoreEffective)
     local unmet    = missingButRunning(unmatchedDescriptors(pool, data))
 
     if #unmet > 0 then
@@ -1353,11 +1422,27 @@ end
 
 -- デバッグ用: 現在の構成に一致するファイルの内容をコンソールに表示
 function obj:dump()
+  -- 共通設定は構成に関係なく効くので、レイアウトの有無によらず先に出す
+  local commonPath = commonConfigPath()
+  if hs.fs.attributes(commonPath) then
+    print("Common: " .. commonPath)
+    print(hs.inspect({ ignore = loadCommonIgnore() }))
+  else
+    print("Common: なし (" .. commonPath .. ")")
+  end
+
   local set = currentScreenSet()
   local path, data = findConfigFile(set)
   if path then
     print("File: " .. path)
-    print(hs.inspect(data))
+    -- ignoreEffective は共通分を連結した実行時の値で、ファイルには存在しない。
+    -- ファイルの内容として読み違えないよう外して出す
+    local shown = {}
+    for k, v in pairs(data) do
+      if k ~= "ignoreEffective" then shown[k] = v end
+    end
+    print(hs.inspect(shown))
+    print("有効な ignore (共通 + このファイル): " .. hs.inspect(data.ignoreEffective))
   else
     print("SpaceSaver: 現在の構成に対応するファイルなし")
     local files = listConfigFiles()

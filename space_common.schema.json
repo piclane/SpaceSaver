@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "space_common.schema.json",
+  "title": "Hammerspoon SpaceCommon",
+  "description": "モニタ構成によらない共通設定。dataDir に space_common.yaml として1つだけ置く。レイアウト定義は space_layouts_<n>.yaml 側にある。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind"],
+  "properties": {
+    "apiVersion": {
+      "const": "v1",
+      "description": "APIバージョン（現在は v1 のみ）"
+    },
+    "kind": {
+      "const": "SpaceCommon",
+      "description": "リソース種別"
+    },
+    "ignore": {
+      "type": "array",
+      "description": "全てのモニタ構成に適用する無視規則。各レイアウトファイルの ignore と連結して使う（どちらかに一致すれば無視）。規則の書式はレイアウトファイルの ignore と同一なので、両者の間で行を移せる。",
+      "items": { "$ref": "space_layouts.schema.json#/$defs/ignoreRule" }
+    }
+  }
+}
