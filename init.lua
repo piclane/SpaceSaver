@@ -6,6 +6,10 @@
 
   ファイル形式: <dataDir>/space_layouts_<n>.yaml (Kubernetes スタイル)
                 dataDir のデフォルトは ~/.hammerspoon (hs.configdir)
+  内部モジュール: space_move.lua   Space をまたぐウィンドウ移動
+                  space_mc.lua     Mission Control 経由の移動（上の代替手段）
+                  space_order.lua  フルスクリーン Space の並べ替え
+
   スキーマ:     Spoon バンドル内の space_layouts.schema.json
                 （保存YAMLの $schema には絶対パスを自動付与）
 
@@ -72,6 +76,9 @@
       （hs.spaces.moveWindowToSpace は macOS 15 以降、成功を返しつつ移動しない）
     - ドラッグ方式は信号ボタン(閉じる/最小化/全画面)の実測位置を基準に掴む。
       左端や上端数pxはリサイズ枠、ボタン群より右はタブ帯に当たるため掴めない
+    - 掴めてもSpaceの切替について来ないアプリ(Excel, LINEなど)は、
+      Mission Control上でサムネイルをドラッグする方式に切り替える。
+      目的のSpaceまで3段以上離れている場合も、そちらのほうが速いので使う
 --]]
 
 local obj = {}
@@ -1122,7 +1129,10 @@ local function restoreCurrentConfig()
       elseif t.kind == "space" then
         spaceMove.moveWindowToSpace(t.win, t.sid, t.desc.frame, obj.spaceSwitchHotkeys,
           function(method)
-            if method == "drag" or method == "failed" then spacesTouched = true end
+            -- Space を切り替える手段はどれも、最後に元の Space へ戻す必要がある
+            if method == "drag" or method == "mc" or method == "failed" then
+              spacesTouched = true
+            end
             local note = t.matchKind == "bundle" and " (bundleIDのみ一致)" or ""
             print(string.format(
               "配置 %s actualTitle=[%s] -> screen=[%s] userSpace#%d spaceID=[%s] move=[%s]%s",

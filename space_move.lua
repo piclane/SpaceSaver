@@ -48,13 +48,19 @@
       done    : 完了コールバック。常に1回だけ、結果を引数に呼ばれる
                 "none"        既に目的 Space に居たのでフレーム補正のみ
                 "native"      hs.spaces.moveWindowToSpace で移動
-                "drag"        ドラッグ方式で移動
+                "drag"        タイトルバーを掴むドラッグ方式で移動
+                "mc"          Mission Control 方式で移動（space_mc.lua）
                 "failed"      移動できずフレーム補正のみ
                 "unsupported" このアプリでは移動できないと判明済みのため
                               試行せずフレーム補正のみ
 --]]
 
 local M = {}
+
+-- Mission Control 方式（space_mc.lua）を読み込む。
+-- 自分と同じフォルダから読むので、Spoon の場所に依存しない
+local MY_DIR = debug.getinfo(1, "S").source:match("^@(.*/)") or "./"
+local spaceMC = dofile(MY_DIR .. "space_mc.lua")
 
 -- ============================================================
 -- タイミング定数（Gist のタイミングを踏襲）
@@ -128,6 +134,20 @@ local nativeMoveWorks = nil
 local dragFailures = {}   -- bundleID -> 連続失敗回数
 local dragBlocked  = {}   -- bundleID -> true なら以降ドラッグを試さない
 local DRAG_GIVEUP  = 3    -- 同じアプリでも成否が揺れることがあるので少し余裕を持たせる
+
+-- Mission Control 方式も効かなかったアプリ。両方だめなら移動を諦める
+local mcFailures = {}     -- bundleID -> 連続失敗回数
+local mcBlocked  = {}     -- bundleID -> true なら以降 Mission Control を試さない
+
+-- ドラッグ方式が効かず Mission Control 方式で移せたアプリ。
+-- 効かないと分かった時点で切り替える。連続失敗を数えてから切り替えたのでは、
+-- そのアプリのウィンドウを移すたびに無駄なドラッグを繰り返すことになる
+local mcPreferred = {}    -- bundleID -> true なら最初から Mission Control 方式
+
+-- ドラッグ方式は 1 Space ずつ送るので、離れているほど時間がかかる（1 段あたり
+-- KEY_DELAY ぶん）。Mission Control 方式は距離によらず 1.8 秒前後で終わるため、
+-- これだけ離れていれば後者のほうが速い
+local MC_STEP_THRESHOLD = 3
 
 -- 掴めた点はアプリ内で共通なので、bundleID ごとに覚えて次から最初に試す
 local grabPoints = {}     -- bundleID -> { dx = 数値, dy = 数値 }
@@ -729,6 +749,44 @@ function M.makeFullScreen(win, screenUUID, frame, done)
   end
 end
 
+-- 目的 Space まで何段離れているか（同じモニタに居ないときは nil）。
+-- ドラッグ方式と Mission Control 方式の使い分けに使う
+local function spaceDistance(win, targetSid)
+  local uuid = hs.spaces.spaceDisplay(targetSid)
+  if not uuid then return nil end
+  local all = hs.spaces.spacesForScreen(uuid) or {}
+  local ti  = indexOf(all, targetSid)
+  if not ti then return nil end
+  for _, s in ipairs(windowSpacesOf(win)) do
+    local ci = indexOf(all, s)
+    if ci then return math.abs(ti - ci) end
+  end
+  return nil
+end
+
+-- Mission Control 方式で移す。成否をログに残し、失敗はアプリ単位で数える
+local function missionControlMove(win, targetSid, frame, done)
+  local bid = bundleIDOf(win)
+  spaceMC.moveWindowToSpace(win, targetSid, function(ok)
+    applyFrame(win, frame)
+    if ok then
+      mcFailures[bid] = 0
+      done("mc")
+      return
+    end
+    mcFailures[bid] = (mcFailures[bid] or 0) + 1
+    print(string.format(
+      "SpaceSaver(space_move): %s を Mission Control でも移動できません [%d/%d]",
+      bid, mcFailures[bid], DRAG_GIVEUP))
+    if mcFailures[bid] >= DRAG_GIVEUP then
+      mcBlocked[bid] = true
+      print(string.format("SpaceSaver(space_move): %s は Space をまたぐ移動に対応できないと"
+        .. "判断しました。以降このアプリではフレーム補正のみ行います", bid))
+    end
+    done("failed")
+  end)
+end
+
 --- win を targetSid の Space へ移動し、frame を適用する。
 --- done(method) は常に1回だけ呼ばれる。
 function M.moveWindowToSpace(win, targetSid, frame, hotkeys, done)
@@ -740,15 +798,46 @@ function M.moveWindowToSpace(win, targetSid, frame, hotkeys, done)
     return
   end
 
-  -- どちらの手段も無効と判明している場合、Space を切り替えずフレームだけ合わせる
-  if nativeMoveWorks == false and dragBlocked[bundleIDOf(win)] then
+  local bid = bundleIDOf(win)
+
+  -- どの手段も無効と判明している場合、Space を切り替えずフレームだけ合わせる
+  if nativeMoveWorks == false and dragBlocked[bid] and mcBlocked[bid] then
     applyFrame(win, frame)
     later(0, function() done("unsupported") end)
     return
   end
 
+  -- ドラッグ方式と Mission Control 方式の使い分け。
+  -- ドラッグ方式は 1 Space ずつ送るので離れているほど時間がかかるが、
+  -- Mission Control 方式は距離によらず一定（実測 1.8 秒前後）。
+  -- 遠い場合と、ドラッグ方式が効かないと分かっているアプリは後者にする
+  local function chooseAndMove()
+    local far = (spaceDistance(win, targetSid) or 0) >= MC_STEP_THRESHOLD
+    if mcBlocked[bid] then
+      dragWindowToSpace(win, targetSid, frame, hotkeys, done)
+      return
+    end
+    if dragBlocked[bid] or mcPreferred[bid] or far then
+      missionControlMove(win, targetSid, frame, done)
+      return
+    end
+    dragWindowToSpace(win, targetSid, frame, hotkeys, function(method)
+      -- 掴めていてもウィンドウが Space の切替について来ないアプリがある。
+      -- その場で Mission Control 方式に切り替えて、この復元のうちに片付ける
+      if method ~= "failed" then done(method); return end
+      missionControlMove(win, targetSid, frame, function(m)
+        if m == "mc" and not mcPreferred[bid] then
+          mcPreferred[bid] = true
+          print(string.format("SpaceSaver(space_move): %s はドラッグ方式では移動できないため、"
+            .. "以降このアプリでは Mission Control 方式を使います", bid))
+        end
+        done(m)
+      end)
+    end)
+  end
+
   if nativeMoveWorks == false then
-    dragWindowToSpace(win, targetSid, frame, hotkeys, done)
+    chooseAndMove()
     return
   end
 
@@ -764,7 +853,7 @@ function M.moveWindowToSpace(win, targetSid, frame, hotkeys, done)
         nativeMoveWorks = false
         print("SpaceSaver(space_move): hs.spaces.moveWindowToSpace が無効。ドラッグ方式に切り替え")
       end
-      dragWindowToSpace(win, targetSid, frame, hotkeys, done)
+      chooseAndMove()
     end
   end)
 end

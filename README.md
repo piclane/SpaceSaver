@@ -83,14 +83,14 @@ brew install yq
 
 ### 2. Spoon を配置
 
-リポジトリを `SpaceSaver.spoon` という名前で `~/.hammerspoon/Spoons/` にクローンします（`init.lua` / `space_move.lua` / `space_layout.svg` / `space_layouts.schema.json` などを含みます）。
+リポジトリを `SpaceSaver.spoon` という名前で `~/.hammerspoon/Spoons/` にクローンします（`init.lua` / `space_move.lua` / `space_mc.lua` / `space_order.lua` / `space_layout.svg` / スキーマ類を含みます）。
 
 ```bash
 mkdir -p ~/.hammerspoon/Spoons
 git clone git@github.com:piclane/SpaceSaver.git ~/.hammerspoon/Spoons/SpaceSaver.spoon
 ```
 
-> エントリポイントは `init.lua` です。`space_move.lua` / `space_layout.svg` / `space_layouts.schema.json` は Spoon バンドル内のリソースとして自動的に解決されます（手動コピー不要）。
+> エントリポイントは `init.lua` です。`space_move.lua` / `space_mc.lua` / `space_order.lua` / `space_layout.svg` / スキーマ類は Spoon バンドル内のリソースとして自動的に解決されます（手動コピー不要）。
 
 ### 3. `~/.hammerspoon/init.lua` に追記
 
@@ -181,9 +181,10 @@ spoon.SpaceSaver:dump()
 |---|---|
 | `none` | 既に目的の Space にいたので位置・サイズだけ合わせた |
 | `native` | `hs.spaces.moveWindowToSpace` で移動できた |
-| `drag` | ドラッグ方式で移動した |
+| `drag` | タイトルバーを掴むドラッグ方式で移動した |
+| `mc` | Mission Control 方式で移動した（→ [Mission Control 方式](#mission-control-方式)） |
 | `failed` | 移動できず、位置・サイズだけ合わせた |
-| `unsupported` | どちらの手段も無効と判明済みなので試さず、位置・サイズだけ合わせた |
+| `unsupported` | どの手段も無効と判明済みなので試さず、位置・サイズだけ合わせた |
 
 フルスクリーン Space のエントリは `move=` ではなく `fullscreen=` が付きます。
 
@@ -254,7 +255,7 @@ SpaceSaver は OS バージョンでは分岐せず、**実際に移動できた
 
 1. ウィンドウが既に目的の Space にいる場合は、位置・サイズを合わせるだけで終わり（**Space は切り替わりません**）
 2. 移動が必要な場合はまず `hs.spaces.moveWindowToSpace` を試し、実際に移動したか検算する
-3. 移動していなければ**ドラッグ方式**に切り替える
+3. 移動していなければ**ドラッグ方式**に切り替える（遠い Space と、ドラッグ方式が効かないアプリは [Mission Control 方式](#mission-control-方式)）
    1. ウィンドウをアプリごと前面に出す（`focus`）
    2. タイトルバーの候補点をつかみ、数 px 動かして本当につかめたか確かめる
    3. ドラッグを保持したまま「操作スペースを左/右に移動」ショートカットを送出し、目的の Space まで 1 つずつ移動する
@@ -317,7 +318,35 @@ SpaceSaver は OS バージョンでは分岐せず、**実際に移動できた
 SpaceSaver(space_move): com.example.app をドラッグで移動できません（Space の切替について来ない, 把持点=+65,+6）[1/3]
 ```
 
-同じアプリで 3 回続けて失敗すると、その起動中は試行をやめて位置とサイズの復元だけ行います。判定はアプリ単位なので、1 つのアプリが失敗しても他のアプリの移動は従来どおり試します。
+このときは、そのまま [Mission Control 方式](#mission-control-方式) に切り替えて移動をやり直します。判定はアプリ単位なので、1 つのアプリが失敗しても他のアプリには影響しません。
+
+### Mission Control 方式
+
+**掴めているのに Space の切替について来ない**アプリがあります。実測では Excel と LINE がこれにあたり、ウィンドウは掴めていて（マウスに合わせてフレームが動く）、それでもショートカットで Space を切り替えるとウィンドウだけ取り残されます。掴む位置・ドラッグ量・切替中の動かし方を変えても結果は同じでした。ドラッグをアプリ自身が処理していて、ウィンドウサーバ側に「ドラッグ中のウィンドウ」が無いためと思われます。
+
+同じ画面・同じ経路で Chrome・Sublime Text・メモは成功するので、環境ではなくアプリの実装差です。
+
+そうしたアプリのために、SpaceSaver は **Mission Control を開き、ウィンドウのサムネイルを Space のサムネイルへドラッグする**手段を持っています。人が手でやる操作をそのままなぞるもので、処理するのは Dock なので、アプリ側の実装差を受けません。
+
+#### 使い分け
+
+| 条件 | 方式 |
+|---|---|
+| 目的の Space まで 3 段以上離れている | Mission Control 方式 |
+| ドラッグ方式が効かないと分かったアプリ | Mission Control 方式 |
+| それ以外 | ドラッグ方式 |
+
+ドラッグ方式は 1 Space ずつ送るため、離れているほど時間がかかります（1 段あたり約 0.6 秒）。Mission Control 方式は**距離によらず 1.8 秒前後**で終わるので、3 段以上離れていれば後者のほうが速くなります。
+
+ドラッグ方式が効かないアプリは、**最初の失敗の時点で**切り替えます。失敗を数えてから切り替えたのでは、そのアプリのウィンドウを移すたびに無駄なドラッグを繰り返すことになるためです。
+
+#### つまずいた点
+
+| 症状 | 原因 |
+|---|---|
+| サムネイルを掴めない | `hs.mouse.absolutePosition` はカーソルをワープさせるだけで `mouseMoved` を出さない。ホバーが付かず、掴める状態にならない。枠の外から中へ `mouseMoved` を出しながら入る |
+| 掴んだつもりで空振りする | AX ツリーは Mission Control のアニメーション途中で既に埋まる。子要素の有無で開き終わりを判断すると、まだ動いているサムネイルを掴もうとする。座標が 2 回続けて同じになるまで待つ |
+| 新しいフルスクリーン Space ができてしまう | ドラッグ中はカーソルの位置に「新規フルスクリーン用の仮枠」が差し込まれ、Space サムネイルの番号が 1 つずれる。しかも仮枠はカーソルと一緒に動く。番号ではなく**名前**で狙う |
 
 ### フルスクリーン Space の並び順
 
@@ -381,7 +410,7 @@ spoon.SpaceSaver:start()
 | フォーカス | 掴む前にウィンドウを前面に出すため、移動したウィンドウのアプリが最前面になる |
 | 隣接 Space のみ移動可 | 目的の Space が離れているほど時間がかかる（途中の Space を 1 つずつ通過する） |
 | cross-screen 移動 | 別スクリーン上のウィンドウはベストエフォート（`setFrame` で寄せてからドラッグ） |
-| 掴めないアプリ | 上端付近に掴める領域が無いアプリでは移動できないことがある（→ [ウィンドウの掴み方](#ウィンドウの掴み方)） |
+| 掴めないアプリ | ドラッグ方式が効かないアプリは Mission Control 方式に切り替わる。その間 Mission Control が開閉する（→ [Mission Control 方式](#mission-control-方式)） |
 
 # Configuration Reference
 
