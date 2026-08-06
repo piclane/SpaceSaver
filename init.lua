@@ -163,10 +163,12 @@ local screenTimer      = nil
 local menubar          = nil
 local windowFilter     = nil   -- 非可視Spaceも含むウィンドウ列挙用（遅延生成）
 
--- 取りこぼしを埋めるために表示した Space の記録（sid -> true）。
--- hs.window.filter は一度見たウィンドウを非可視 Space に移っても保持し続けるため、
--- 同じ Space を同一セッション内で二度表示しても新しい発見はない。
-local rescannedSpaces  = {}
+-- 一度でも評価したウィンドウの ID（プールに入れたものも、標準ウィンドウでないと
+-- 弾いたものも含む）。どの Space を表示して拾い直すかの判断に使う。
+-- 「表示済みの Space は二度と見ない」とすると、その後に開かれたウィンドウを
+-- 永久に拾えなくなる。ウィンドウ単位で覚えれば、新しいウィンドウがある Space だけを
+-- 選んで表示できる。
+local evaluatedWindows = {}
 
 -- ============================================================
 -- ユーティリティ
@@ -672,6 +674,12 @@ end
 
 -- win から { win=..., desc=... } のプールエントリを作る（対象外なら nil）
 local function poolEntry(win, ignoreRules)
+  -- 弾いた場合も評価済みとして覚える。覚えないと、通知センターのような
+  -- 標準でないウィンドウが居座る Space を毎回表示しに行くことになる
+  local wid = nil
+  pcall(function() wid = win:id() end)
+  if wid then evaluatedWindows[wid] = true end
+
   -- hs.window.allWindows() に倣い、Finder のデスクトップ (AXScrollArea) のような
   -- ウィンドウでないものを除く。role を読めなかったときは除外しない。
   -- 除外すると、非可視 Space のウィンドウを取りこぼして配置対象から漏らす恐れがある
@@ -691,6 +699,20 @@ local function poolEntry(win, ignoreRules)
   if isIgnored(ignoreRules, desc.bundleID, desc.title) then return nil end
 
   return { win = win, desc = desc }
+end
+
+-- その Space に、まだ評価していないウィンドウがあるか。
+-- hs.spaces.windowsForSpace は Space を表示しなくてもウィンドウ ID を返すので、
+-- 表示する価値があるかを切り替える前に判断できる（ID から hs.window を
+-- 復元することはできないため、実際に拾うには表示するしかない）。
+-- 判断できないときは true を返す。取りこぼすより一度表示するほうがまし
+local function hasUnevaluatedWindow(sid)
+  local ok, ids = pcall(hs.spaces.windowsForSpace, sid)
+  if not ok or type(ids) ~= "table" then return true end
+  for _, id in ipairs(ids) do
+    if not evaluatedWindows[id] then return true end
+  end
+  return false
 end
 
 -- Space を切り替えずにウィンドウプールを構築する
@@ -1153,7 +1175,8 @@ local function restoreCurrentConfig()
   -- hs.window.get は nil を返す。表示する以外に取得する手段がない。
   -- 全 Space を舐めると画面が何度も切り替わるので、次の3点で回数を抑える。
   --   1. アクティブな Space は既にプールへ入っているので飛ばす
-  --   2. 同一セッションで表示済みの Space は飛ばす（filter が保持し続けている）
+  --   2. 既に評価したウィンドウしか無い Space は飛ばす。所属ウィンドウの ID は
+  --      表示しなくても読めるので、表示する価値があるかを先に判断できる
   --   3. 照合できない記述が無くなった時点で打ち切る
   -- 3 が早く効くよう、照合できない記述を置くモニタの Space から先に見る。
   local function rescanSpaces(pool, onDone)
@@ -1183,7 +1206,7 @@ local function restoreCurrentConfig()
     local worklist = {}
     local function addSpacesOf(plan)
       for _, sid in ipairs(hs.spaces.spacesForScreen(plan.uuid) or {}) do
-        if not active[sid] and not rescannedSpaces[sid] then
+        if not active[sid] and hasUnevaluatedWindow(sid) then
           table.insert(worklist, sid)
         end
       end
@@ -1212,13 +1235,15 @@ local function restoreCurrentConfig()
     local function step(i)
       if i > #worklist then onDone(pool); return end
       local sid = worklist[i]
-      rescannedSpaces[sid] = true
       pcall(hs.spaces.gotoSpace, sid)
       later(CAPTURE_SETTLE, function()
         local added = 0
         local wok, winIDs = pcall(hs.spaces.windowsForSpace, sid)
         if wok and winIDs then
           for _, wid in ipairs(winIDs) do
+            -- 表示したうえで取れなかったウィンドウも評価済みとして覚える。
+            -- 覚えないと、取れないウィンドウのある Space を毎回表示しに行く
+            evaluatedWindows[wid] = true
             if not seen[wid] then
               seen[wid] = true
               local win = hs.window.get(wid)
