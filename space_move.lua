@@ -89,6 +89,12 @@ local KEY_DELAY    = 0.6   -- 各ショートカット送出後（Space 切替�
 local KEY_HOLD     = 0.03  -- keyDown から keyUp まで（秒）
 local DROP_DELAY   = 0.1   -- mouseUp 後、フレーム復元まで（秒）
 local VERIFY_DELAY = 0.2   -- 純正 API 実行後、windowSpaces を検算するまで（秒）
+-- 移動の成否は windowSpaces で見るが、この値は操作の直後にはまだ古い。
+-- 一度見ただけで判断すると、移動できているのに失敗と誤判定する。
+-- 誤判定はログを汚すだけでなく、アプリ単位の失敗数を積み上げて
+-- そのアプリの移動を諦めさせてしまうので、真になるまで見に行く
+local SETTLE_POLL    = 0.05 -- 所属 Space の反映を見に行く間隔（秒）
+local SETTLE_TIMEOUT = 1.5  -- 同上の上限（秒）
 local TIMEOUT_BASE = 3.0   -- 安全タイムアウトの固定分（秒）。可変分は Space 移動段数に比例
 
 -- フルスクリーン切替はアニメーションを伴うため、各段で収まるのを待つ
@@ -195,6 +201,24 @@ local function windowSpacesOf(win)
   local ok, r = pcall(hs.spaces.windowSpaces, win)
   if ok and type(r) == "table" then return r end
   return {}
+end
+
+-- cond() が真になるまで待って cb(真になったか) を呼ぶ。
+-- 真ならその時点で、駄目なら timeout 秒後に呼ぶ
+local function waitUntil(cond, timeout, cb)
+  local t0 = hs.timer.secondsSinceEpoch()
+  local function step()
+    if cond() then cb(true); return end
+    if hs.timer.secondsSinceEpoch() - t0 > timeout then cb(false); return end
+    later(SETTLE_POLL, step)
+  end
+  step()
+end
+
+-- win が targetSid に入るのを待つ
+local function waitForSpace(win, targetSid, cb)
+  waitUntil(function() return indexOf(windowSpacesOf(win), targetSid) ~= nil end,
+    SETTLE_TIMEOUT, cb)
 end
 
 -- frame が指定されていればウィンドウに適用する
@@ -521,13 +545,12 @@ local function dragWindowToSpace(win, targetSid, frame, hotkeys, done)
     -- 動かす必要のないウィンドウを掴んで揺らすだけになる
     if curSid == targetSid then
       applyFrame(win, frame)
-      later(DROP_DELAY, function()
-        if indexOf(windowSpacesOf(win), targetSid) then
-          finish("none")
-        else
-          noteDragFailure(win, "寄せても目的の Space に入らない")
-          finish("failed")
-        end
+      -- setFrame で別スクリーンへ寄せた直後は windowSpaces がまだ古い Space を返す。
+      -- 入るまで待たないと、寄せられているのに失敗と誤判定する
+      waitForSpace(win, targetSid, function(ok)
+        if ok then finish("none"); return end
+        noteDragFailure(win, "寄せても目的の Space に入らない")
+        finish("failed")
       end)
       return
     end
@@ -541,7 +564,8 @@ local function dragWindowToSpace(win, targetSid, frame, hotkeys, done)
 
     -- フェイルセーフ: 想定所要時間を超えたら強制完了（復元全体が止まらないよう）
     timeoutTimer = later(
-      TIMEOUT_BASE + GOTO_DELAY + (#allSpaces + 1) * (KEY_DELAY + KEY_HOLD),
+      TIMEOUT_BASE + GOTO_DELAY + SETTLE_TIMEOUT
+        + (#allSpaces + 1) * (KEY_DELAY + KEY_HOLD),
       function()
         noteDragFailure(win, "タイムアウト")
         finish("failed")
@@ -565,13 +589,16 @@ local function dragWindowToSpace(win, targetSid, frame, hotkeys, done)
         later(DROP_DELAY, function()
           applyFrame(win, frame)
           local bid = bundleIDOf(win)
-          if indexOf(windowSpacesOf(win), targetSid) then
-            -- 効いた点を覚えて、次のウィンドウではここから試す
-            grabPoints[bid]   = { dx = gdx, dy = gdy }
-            grabRotation[bid] = 0
-            dragFailures[bid] = 0
-            finish("drag")
-          else
+          -- 放した直後は windowSpaces がまだ追いついていないことがある
+          waitForSpace(win, targetSid, function(arrived)
+            if arrived then
+              -- 効いた点を覚えて、次のウィンドウではここから試す
+              grabPoints[bid]   = { dx = gdx, dy = gdy }
+              grabRotation[bid] = 0
+              dragFailures[bid] = 0
+              finish("drag")
+              return
+            end
             -- この点では掴めていなかった可能性がある。次の試行では別の点から始める
             grabRotation[bid] = (grabRotation[bid] or 0) + 1
             if grabPoints[bid] and grabPoints[bid].dx == gdx
@@ -580,7 +607,7 @@ local function dragWindowToSpace(win, targetSid, frame, hotkeys, done)
             end
             noteDragFailure(win, string.format("%s, 把持点=+%d,+%d", reason, gdx, gdy))
             finish("failed")
-          end
+          end)
         end)
       end
 
