@@ -137,7 +137,16 @@ local YQ_DEFAULT = "/opt/homebrew/bin/yq"
 -- 掛かるとレイアウトファイルとして毎回読み込まれる
 local COMMON_BASENAME = "space_common"
 
-local SCREEN_SETTLE  = 2.0   -- 秒: モニター変化後、復元開始までのデバウンス
+local SCREEN_SETTLE  = 2.0   -- 秒: モニター変化後、様子を見始めるまでのデバウンス
+
+-- モニタは一斉には繋がらない。とくに DisplayLink 経由のものは、認識されてから
+-- 解像度が確定するまで時間がかかり、その間に何度も構成が変わる。
+-- 途中の構成で復元を始めると、残りのモニタが繋がった時点で macOS がウィンドウを
+-- 動かし直すため、せっかく合わせた配置が崩れる。
+-- そこで、構成が変わらなくなったことを確かめてから始める
+local SCREEN_STABLE_STEP  = 1.0  -- 秒: 構成が落ち着いたかを確かめる間隔
+local SCREEN_STABLE_COUNT = 3    -- 回: これだけ連続で同じなら落ち着いたとみなす
+local SCREEN_STABLE_MAX   = 60.0 -- 秒: 落ち着くのを待つ上限
 local RESTORE_DELAY  = 1.0   -- 秒: Space追加/削除後、ウィンドウ移動までの待機
 local CAPTURE_SETTLE = 0.6   -- 秒: gotoSpace後、ウィンドウ取得までの待機
 local MC_STEP_DELAY  = 0.6   -- 秒: Space追加/削除(Mission Control操作)の各ステップ間の待機
@@ -420,6 +429,58 @@ local function screenSignature(set)
   for u in pairs(set) do table.insert(uuids, u) end
   table.sort(uuids)
   return table.concat(uuids, "+")
+end
+
+-- 構成が落ち着いたかを見るための署名。UUID だけでなく矩形も含める。
+-- DisplayLink 経由のモニタは、認識された直後と解像度が確定した後で矩形が変わる。
+-- UUID だけで見ていると、解像度が確定する前に復元を始めてしまう
+local function screenStateSignature()
+  local parts = {}
+  for _, scr in ipairs(hs.screen.allScreens()) do
+    local u = scr:getUUID()
+    local ok, f = pcall(function() return scr:fullFrame() end)
+    if u and ok and f then
+      parts[#parts + 1] = string.format("%s:%d,%d,%d,%d", u, f.x, f.y, f.w, f.h)
+    end
+  end
+  table.sort(parts)
+  return table.concat(parts, "+")
+end
+
+-- モニタ構成が落ち着くまで待ってから fn を呼ぶ。
+-- 待っている間に構成が変われば数え直すので、モニタが1台ずつ現れる環境でも
+-- 最後の1台が確定してから復元を始められる。
+-- 待ちが二重に走らないよう、実行中は新しい待ちを始めない（走っている待ちが
+-- 毎回読み直すので、あとから変わった分もそちらが拾う）
+local screenSettling = false
+local function afterScreensSettle(fn)
+  if screenSettling then return end
+  screenSettling = true
+
+  local last, same, waited = nil, 0, 0
+  local function step()
+    local sig = screenStateSignature()
+    if sig == last then same = same + 1 else same, last = 1, sig end
+
+    local settled = (same >= SCREEN_STABLE_COUNT)
+    if not settled and waited >= SCREEN_STABLE_MAX then
+      print("SpaceSaver: モニタ構成が落ち着かないまま上限に達したので復元を始めます")
+      settled = true
+    end
+    if settled then
+      if waited > 0 then
+        print(string.format("SpaceSaver: モニタ構成が落ち着くまで %.0f 秒待ちました", waited))
+      end
+      screenSettling = false
+      fn()
+      return
+    end
+
+    waited = waited + SCREEN_STABLE_STEP
+    later(SCREEN_STABLE_STEP, step)
+  end
+
+  step()
 end
 
 -- ============================================================
@@ -1433,10 +1494,12 @@ function obj:start()
   hs.urlevent.bind("space-capture", function() obj:capture() end)
   hs.urlevent.bind("space-restore", function() restoreCurrentConfig() end)
 
-  -- スクリーンウォッチャー（SCREEN_SETTLE秒のデバウンス付き）
+  -- スクリーンウォッチャー（デバウンスのあと、構成が落ち着くのを待って復元）
   screenWatcher = hs.screen.watcher.new(function()
     if screenTimer then screenTimer:stop() end
-    screenTimer = hs.timer.doAfter(SCREEN_SETTLE, onScreenChange)
+    screenTimer = hs.timer.doAfter(SCREEN_SETTLE, function()
+      afterScreensSettle(onScreenChange)
+    end)
   end)
   screenWatcher:start()
 
