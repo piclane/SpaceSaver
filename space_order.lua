@@ -32,6 +32,8 @@ local OPEN_DELAY   = 1.0  -- Mission Control を開いた後、最初に AX を�
 local STABLE_STEP  = 0.3  -- サムネイル座標の安定判定の間隔（秒）
 local STABLE_TRIES = 12   -- 同上の最大試行回数
 local HOVER_DELAY  = 0.6  -- カーソルを上端へ置いてから（秒）
+local HOVER_STEPS  = 20   -- 上端へ入るときに送る mouseMoved の回数
+local HOVER_HOLD   = 0.02 -- 同上の1回あたりの間隔（秒）
 local GRAB_DELAY  = 0.5   -- マウス移動後、押下まで（秒）
 local DOWN_DELAY  = 0.5   -- 押下後、ドラッグ開始まで（秒）
 local DRAG_STEP   = 0.05  -- ドラッグ1コマあたり（秒）
@@ -105,44 +107,101 @@ local function framesSignature(list)
   local t = {}
   for i, e in ipairs(list) do
     local f = e:attributeValue("AXFrame")
-    t[i] = f and string.format("%d,%d,%d,%d", f.x, f.y, f.w, f.h) or "?"
+    -- Retina では座標が 784.5 のような小数になる。%d は小数を整数化できず
+    -- 例外を投げるので、必ず math.floor を通す。
+    -- ここで投げると waitForStableList のコールバック連鎖が止まり、
+    -- 並べ替えの done が呼ばれないまま復元が終わらなくなる
+    t[i] = f and string.format("%d,%d,%d,%d",
+      math.floor(f.x), math.floor(f.y), math.floor(f.w), math.floor(f.h)) or "?"
   end
   return table.concat(t, "|")
 end
 
+-- 診断用。AXFrame を読める形にする（小数をそのまま出す）
+local function fmtFrame(f)
+  if not f then return "nil" end
+  return string.format("x=%g y=%g w=%g h=%g", f.x, f.y, f.w, f.h)
+end
+
+-- 診断用。読めなければ nil を返す（例外を診断の途中で投げないため）
+local function attrOf(el, name)
+  local ok, v = pcall(function() return el:attributeValue(name) end)
+  return ok and v or nil
+end
+
 -- Mission Control の Space バーは、カーソルがその画面の上端に無いと
--- 小さいピル表示のままで、サムネイルの AXFrame も得られない。
+-- 小さいピル表示のままで、サムネイルの AXFrame は画面の外（負の y）を指す。
 -- AX の値に頼らず、画面の矩形から上端中央へカーソルを移す。
+--
+-- hs.mouse.absolutePosition はカーソルをワープさせるだけで mouseMoved を出さない。
+-- それではホバーが付かず、バーは畳まれたままで座標が使えない。
+-- 下から上端へ mouseMoved を送りながら入る（space_mc.lua の hoverInto と同じ考え方）
+local ev = hs.eventtap.event
+
 local function hoverTopOfScreen(screenUUID)
   local scr = hs.screen.find(screenUUID)
   if not scr then return end
   local f = scr:fullFrame()
-  hs.mouse.absolutePosition(hs.geometry.point(f.x + f.w / 2, f.y + 12))
+  local x     = f.x + f.w / 2
+  local fromY = f.y + math.min(300, f.h / 3)
+  local toY   = f.y + 5
+  hs.mouse.absolutePosition(hs.geometry.point(x, fromY))
+  local prevY = fromY
+  for i = 1, HOVER_STEPS do
+    local y = fromY + (toY - fromY) * (i / HOVER_STEPS)
+    local e = ev.newMouseEvent(ev.types.mouseMoved, hs.geometry.point(x, y))
+    e:setProperty(ev.properties.mouseEventDeltaX, 0)
+    e:setProperty(ev.properties.mouseEventDeltaY, math.floor(y - prevY))
+    e:post()
+    prevY = y
+    hs.timer.usleep(math.floor(HOVER_HOLD * 1000000))
+  end
 end
 
 -- サムネイルの座標がすべて対象モニタの矩形内にあるか。
 -- Space バーが展開していないと別モニタの座標が返ることがあり、
 -- そのまま掴むと関係のない画面をドラッグしてしまう。
+-- 第2戻り値に、外れた理由を診断用の文字列で返す（呼び出し側はログにだけ使う）
 local function framesOnScreen(list, screenUUID)
   local scr = hs.screen.find(screenUUID)
-  if not scr or #list == 0 then return false end
+  if not scr then return false, "画面が見つからない" end
+  if #list == 0 then return false, "サムネイルが0件" end
   local sf = scr:fullFrame()
-  for _, e in ipairs(list) do
+  for i, e in ipairs(list) do
     local f = e:attributeValue("AXFrame")
-    if not f then return false end
+    if not f then
+      return false, string.format("[%d] の AXFrame が読めない", i)
+    end
     local cx, cy = f.x + f.w / 2, f.y + f.h / 2
     if cx < sf.x or cx > sf.x + sf.w or cy < sf.y or cy > sf.y + sf.h then
-      return false
+      return false, string.format("[%d] の中心 (%g,%g) が画面 %s の外",
+        i, cx, cy, fmtFrame(sf))
     end
   end
-  return true
+  return true, nil
 end
 
--- 座標が2回続けて同じで、かつ対象モニタ内に収まるまで待つ
+-- 座標が2回続けて同じで、かつ対象モニタ内に収まるまで待つ。
+-- AX の読み取りは pcall で囲む。ここで例外を投げると cb が呼ばれず、
+-- 呼び出し側の連鎖が止まって復元が終わらなくなる。
+-- 最後に外れた理由は lastReason に控え、時間切れのときログに出す
+local lastReason = nil
+
 local function waitForStableList(screenID, screenUUID, tries, prev, cb)
-  local list = spacesListElements(screenID)
-  local sig  = framesSignature(list)
-  if #list > 0 and sig == prev and framesOnScreen(list, screenUUID) then
+  local ok, list, sig = pcall(function()
+    local l = spacesListElements(screenID)
+    return l, framesSignature(l)
+  end)
+  if not ok then
+    lastReason = "AX の読み取りで例外: " .. tostring(list)
+    print("SpaceSaver(space_order): " .. lastReason)
+    cb({}, true); return
+  end
+
+  local onScreen, why = framesOnScreen(list, screenUUID)
+  if not onScreen then lastReason = why end
+  if #list > 0 and sig == prev and onScreen then
+    lastReason = nil
     cb(list); return
   end
   if tries <= 0 then cb(list, true); return end
@@ -270,8 +329,16 @@ function M.arrange(screenUUID, targets, done)
     hoverTopOfScreen(screenUUID)
     later(HOVER_DELAY, function()
     waitForStableList(screenID, screenUUID, STABLE_TRIES, nil, function(list, timedOut)
-      if timedOut or not framesOnScreen(list, screenUUID) then
-        print("SpaceSaver(space_order): Space バーの座標が安定しないため並べ替えを中止")
+      local onScreen, why = framesOnScreen(list, screenUUID)
+      if timedOut or not onScreen then
+        print(string.format(
+          "SpaceSaver(space_order): Space バーの座標が安定しないため並べ替えを中止"
+          .. " [診断] 時間切れ=%s 理由=[%s] サムネイル=%d件",
+          tostring(timedOut), tostring(why or lastReason), #list))
+        for i, e in ipairs(list) do
+          print(string.format("  [%d] title=[%s] frame=%s",
+            i, tostring(attrOf(e, "AXTitle")), fmtFrame(attrOf(e, "AXFrame"))))
+        end
         finish(); return
       end
       if #list ~= #ord then

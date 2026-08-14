@@ -55,6 +55,7 @@ local AFTER_CLOSE   = 0.25 -- Mission Control を閉じた後（秒）
 local HOVER_STEPS   = 5    -- 枠の外から中へ入る mouseMoved の回数
 local HOVER_HOLD    = 0.03
 local HOVER_OUTSIDE = 40   -- 枠の何 px 外から入るか
+local PARK_SETTLE   = 0.25 -- サムネイルの外へ退かしてから、掴みに入るまで（秒）
 local DRAG_STEPS    = 10   -- サムネイルを Space バーへ運ぶ分割数
 local DRAG_HOLD     = 0.03
 local AIM_STEPS     = 5    -- 狙いを直すときの分割数
@@ -162,12 +163,71 @@ local function frameOf(el)
   return (ok and type(f) == "table") and f or nil
 end
 
+-- 診断用。AXFrame を読める形にする。%d は小数を整数化できず例外を投げるので %g を使う
+local function fmtFrame(f)
+  if not f then return "nil" end
+  return string.format("x=%g y=%g w=%g h=%g", f.x, f.y, f.w, f.h)
+end
+
+-- 画面上部の Space バー（mc.spaces グループ）の枠。畳んでいるときも高さは読める。
+-- サムネイルは画面の縮小版なので、バーの高さはモニタの縦横比で変わる。
+-- 固定の px を狙うとモニタによって当たらないので、この枠から導く。
+-- frameOf を使うので、その宣言より後に置くこと
+local function spacesBarFrame(disp)
+  local g = groupNamed(disp, "mc.spaces")
+  return g and frameOf(g) or nil
+end
+
 -- 名前が一致する Space サムネイルを返す
 local function spaceThumbNamed(disp, name)
   for _, b in ipairs(spaceThumbs(disp)) do
     if titleOf(b) == name then return b end
   end
   return nil
+end
+
+-- 点がサムネイルの枠の内側か
+local function inFrame(f, x, y)
+  return f and x >= f.x and x <= f.x + f.w and y >= f.y and y <= f.y + f.h
+end
+
+-- どのウィンドウサムネイルにも載っていない待機点を返す。
+-- サムネイルの上でカーソルが止まっていると、そこから動かしても
+-- 「入る」遷移が起きず、ホバーが付かないまま掴めない。
+-- 画面下端から少しずつ上へ探し、どれにも入らない点を選ぶ
+local function parkPoint(disp, ff)
+  local frames = {}
+  for _, b in ipairs(windowThumbs(disp)) do
+    local f = frameOf(b)
+    if f then frames[#frames + 1] = f end
+  end
+  local x = ff.x + ff.w / 2
+  for _, y in ipairs({ ff.y + ff.h - 2, ff.y + ff.h - 40, ff.y + 2 }) do
+    local free = true
+    for _, f in ipairs(frames) do
+      if inFrame(f, x, y) then free = false; break end
+    end
+    if free then return x, y end
+  end
+  -- どこも空いていなければ、左下の隅を使う（サムネイルは中央寄りに並ぶ）
+  return ff.x + 2, ff.y + ff.h - 2
+end
+
+-- カーソル位置に中心が一致するサムネイルを探す。
+-- 掴めたサムネイルは縮んでカーソルに追従し、中心がカーソルと一致する。
+-- 掴めたかどうかを厳密に判定できる（1枚掴むと残りは再レイアウトされるので、
+-- 「枠が動いたか」だけでは掴めたかを判定できない）
+local function thumbAtCursor(disp, x, y)
+  local best, bestD
+  for i, b in ipairs(windowThumbs(disp)) do
+    local f = frameOf(b)
+    if f then
+      local dx, dy = (f.x + f.w / 2) - x, (f.y + f.h / 2) - y
+      local d = math.sqrt(dx * dx + dy * dy)
+      if not bestD or d < bestD then best, bestD = i, d end
+    end
+  end
+  return best, bestD
 end
 
 -- サムネイルの座標をまとめた文字列。動きが止まったかの判定に使う
@@ -196,13 +256,16 @@ local function postAt(kind, pt, dx, dy)
 end
 
 -- 枠の外から中へ mouseMoved を出しながら入る。
--- これでホバーが付き、サムネイルを掴めるようになる
+-- これでホバーが付き、サムネイルを掴めるようになる。
+-- 移動量 (deltaX/deltaY) も載せる。載せないと Dock がホバーとして扱わないことがある
 local function hoverInto(fromX, fromY, toX, toY)
   hs.mouse.absolutePosition(hs.geometry.point(fromX, fromY))
+  local px, py = fromX, fromY
   for i = 1, HOVER_STEPS do
     local t = i / HOVER_STEPS
-    postAt(ev.types.mouseMoved,
-      hs.geometry.point(fromX + (toX - fromX) * t, fromY + (toY - fromY) * t))
+    local x, y = fromX + (toX - fromX) * t, fromY + (toY - fromY) * t
+    postAt(ev.types.mouseMoved, hs.geometry.point(x, y), x - px, y - py)
+    px, py = x, y
     sleep(HOVER_HOLD)
   end
 end
@@ -308,6 +371,18 @@ function M.moveWindowToSpace(win, targetSid, done)
       finish(false); return
     end
 
+    -- 上端へ運ぶときの縦位置。サムネイルは画面の縮小版なのでバーの高さは
+    -- モニタの縦横比で変わる。固定値だとモニタによって外れるため枠から導く
+    local bar  = spacesBarFrame(disp)
+    local barY = bar and (bar.y + bar.h / 2) or (ff.y + 45)
+
+    -- 掴む前に、どのサムネイルにも載っていない点へ退かす。
+    -- Mission Control が開いた時点でカーソルがサムネイルの上にあると、
+    -- そこから動かしても「入る」遷移が起きず、ホバーが付かないまま掴めない
+    local px, py = parkPoint(disp, ff)
+    hs.mouse.absolutePosition(hs.geometry.point(px, py))
+    sleep(PARK_SETTLE)
+
     hoverInto(math.max(ff.x + 2, wf.x - HOVER_OUTSIDE), cy, cx, cy)
     curX, curY = cx, cy
     postAt(ev.types.leftMouseDown, hs.geometry.point(cx, cy))
@@ -317,15 +392,31 @@ function M.moveWindowToSpace(win, targetSid, done)
       -- 画面上端の中央を経由せず、目的のサムネイルへ斜めに直行する。
       -- 中央にはドラッグ中だけ仮枠ができるので、そこへ落とすと
       -- 新しいフルスクリーン Space が作られてしまう
-      dragTo(aimX, ff.y + 45, DRAG_STEPS)
+      dragTo(aimX, barY, DRAG_STEPS)
 
-      -- バーが開いて座標が使えるようになるのを待つ
+      -- バーが開いて座標が使えるようになるのを待つ。
+      -- ドラッグ中に何が見えていたかを控え、時間切れのときに出す
+      local lastSeen, sawNil, polls = nil, 0, 0
       pollUntil(function()
+        polls = polls + 1
         local f = frameOf(spaceThumbNamed(disp, wantName))
+        if f then lastSeen = f else sawNil = sawNil + 1 end
         return f and f.y >= ff.y
       end, BAR_TIMEOUT, function(opened)
         if not opened then
-          print("SpaceSaver(space_mc): Space バーが開かない")
+          -- 掴めたサムネイルは縮んでカーソルに追従し、中心がカーソルと一致する。
+          -- 1枚掴むと残りは再レイアウトされるので、「枠が動いたか」では判定できない
+          local nearIdx, nearD = thumbAtCursor(disp, curX, curY)
+          print(string.format(
+            "SpaceSaver(space_mc): Space バーが開かない"
+            .. " [診断] 目的=[%s] 最後に読めた枠=%s 必要条件 f.y>=%g"
+            .. " / 読めなかった回数=%d/%d カーソル=(%g,%g)"
+            .. " / 退避点=(%g,%g) 掴んだ枠=%s"
+            .. " / カーソル直下のサムネイル=#%s 中心との距離=%s 掴めた=%s",
+            wantName, fmtFrame(lastSeen), ff.y, sawNil, polls, curX, curY,
+            px, py, fmtFrame(frameOf(thumb)),
+            tostring(nearIdx), nearD and string.format("%.1f", nearD) or "nil",
+            tostring(nearD ~= nil and nearD < 30)))
           finish(false); return
         end
 
@@ -336,10 +427,18 @@ function M.moveWindowToSpace(win, targetSid, done)
           tries = tries + 1
           local f = frameOf(spaceThumbNamed(disp, wantName))
           if not f or f.y < ff.y then
-            if tries >= AIM_TRIES then finish(false); return end
+            if tries >= AIM_TRIES then
+              print(string.format(
+                "SpaceSaver(space_mc): Space バーが展開しないため寄せ直せない"
+                .. " 枠=%s 必要条件 f.y>=%g", fmtFrame(f), ff.y))
+              finish(false); return
+            end
             later(AIM_SETTLE, aim); return
           end
-          if curX >= f.x + 8 and curX <= f.x + f.w - 8 then
+          -- 縦も見る。バーが展開するとサムネイルは下へ伸びる（実測 y=-32 h=24 →
+          -- y=70 h=90）ので、横だけ見て離すと、まだサムネイルの上にいるうちに落とす
+          if curX >= f.x + 8 and curX <= f.x + f.w - 8
+             and curY >= f.y + 8 and curY <= f.y + f.h - 8 then
             later(DROP_HOLD, function()
               postAt(ev.types.leftMouseUp, hs.geometry.point(curX, curY))
               mouseIsDown = false
@@ -351,9 +450,15 @@ function M.moveWindowToSpace(win, targetSid, done)
             return
           end
           if tries >= AIM_TRIES then
-            print("SpaceSaver(space_mc): 目的 Space のサムネイルに寄せられない")
+            print(string.format(
+              "SpaceSaver(space_mc): 目的 Space のサムネイルに寄せられない"
+              .. " 枠=%s カーソル=(%g,%g) 判定範囲 x=%g..%g y=%g..%g",
+              fmtFrame(f), curX, curY,
+              f.x + 8, f.x + f.w - 8, f.y + 8, f.y + f.h - 8))
             finish(false); return
           end
+          -- サムネイルの中心へ寄せ直す。バーが展開すると位置も大きさも変わるので、
+          -- 掴む前に読んだ座標ではなく、そのつど読み直した枠を使う
           dragTo(f.x + f.w / 2, f.y + f.h / 2, AIM_STEPS)
           later(AIM_SETTLE, aim)
         end
@@ -367,8 +472,10 @@ function M.moveWindowToSpace(win, targetSid, done)
   -- ------------------------------------------------------------
   local function openThen(attempt)
     -- 掴む前にカーソルをサムネイル群から離しておく。
-    -- 開いた瞬間にサムネイルへ乗っていると、動かすまでホバーが付かない
-    hs.mouse.absolutePosition(hs.geometry.point(ff.x + ff.w / 2, ff.y + ff.h - 120))
+    -- 開いた瞬間にサムネイルへ乗っていると、動かすまでホバーが付かない。
+    -- 開く前はまだサムネイルの枠を読めないので画面の下端に置く。
+    -- 120px などの決め打ちだと、ウィンドウが多いときサムネイルの中に着地する
+    hs.mouse.absolutePosition(hs.geometry.point(ff.x + ff.w / 2, ff.y + ff.h - 2))
     pcall(hs.spaces.openMissionControl)
 
     local prevSig
