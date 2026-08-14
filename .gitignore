@@ -2,3 +2,6 @@
 space_layouts_*.yaml
 p.md
 p?.md
+
+# luac が既定で書き出すコンパイル結果
+luac.out
