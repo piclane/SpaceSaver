@@ -106,14 +106,16 @@ obj.dataDir  = hs.configdir
 --   }
 obj.spaceSwitchHotkeys = nil
 
--- 照合できないウィンドウがあったとき、その Space を表示して拾い直すか。
+-- まだ評価していないウィンドウがある Space を、復元の前に表示して拾うか。
 -- macOS は非可視 Space のウィンドウを AX に出さない。通常は hs.window.filter が
 -- 一度見たウィンドウを保持し続けるので表示せずに済むが、Hammerspoon の起動・リロード
 -- 直後はそのキャッシュが空で、別 Space に置かれたウィンドウを取りこぼす。
 -- 埋めるには対象 Space を一度表示するしかない。
--- アクティブな Space と表示済みの Space は飛ばし、照合できない記述が無くなれば
--- 打ち切るので、実際に切り替わるのは起動後の初回だけで済む。
+-- アクティブな Space と、評価済みのウィンドウしか無い Space は飛ばす。
+-- 評価済みはリロードまで覚えているので、実際に切り替わるのはリロード後の初回と、
+-- 非可視 Space に新しいウィンドウが増えたときだけで済む。
 -- 復元中に一切画面を切り替えたくない場合は false にする。
+-- その場合、リロード直後は非可視 Space のウィンドウを取りこぼしたまま配置する。
 obj.rescanSpacesIfIncomplete = true
 
 -- フルスクリーン Space をレイアウトどおりの位置へ並べ替えるか。
@@ -532,27 +534,6 @@ local function titleMatches(desc, actualTitle)
   return actualTitle == (desc.title or "")
 end
 
--- pool（{ win=ウィンドウ, desc=windowDescriptor } のリスト）から desc に最も近いエントリを取り出す
--- 戻り値: entry, matchKind
---   matchKind = "title"  : bundleID + タイトル一致（優先1）
---   matchKind = "bundle" : 同bundleIDのみ一致（フォールバック）
---   matchKind = nil      : 不一致
-local function takeMatchingWindow(desc, pool)
-  -- 優先1: bundleID + タイトル一致（パターン優先）
-  for i, entry in ipairs(pool) do
-    if entry.desc.bundleID == desc.bundleID and titleMatches(desc, entry.desc.title) then
-      return table.remove(pool, i), "title"
-    end
-  end
-  -- 優先2: 同bundleIDのフォールバック
-  for i, entry in ipairs(pool) do
-    if entry.desc.bundleID == desc.bundleID then
-      return table.remove(pool, i), "bundle"
-    end
-  end
-  return nil, nil
-end
-
 -- titlePattern の「自由度の低さ」を数える。
 -- 必ず一致しなければならないリテラル文字を数え、位置を固定するアンカーを加点する。
 -- '.*' は 0、'^SpaceSaver.spoon – ' は 20 前後になる。
@@ -592,62 +573,44 @@ local function patternSpecificity(pat)
 end
 
 -- 記述の絞り込みの強さ。大きいほど自由度が低い。
--- title の完全一致はどのパターンより強い
+-- ウィンドウの行き先を決める主基準。title の完全一致はどのパターンより強い
 local function descSpecificity(desc)
   if desc.titlePattern then return patternSpecificity(desc.titlePattern) end
   return 1000 + #(desc.title or "")
 end
 
--- レイアウトのスロットにウィンドウを割り当てる。
--- 優先順位は 1) 候補が少ない記述 2) 自由度が低い記述 3) レイアウトの記述順。
--- 記述順で素朴に取っていくと、'.*' のように広く当たるパターンが、
--- 特定のウィンドウを名指しする記述の取り分を先に奪ってしまう。
--- 候補数だけで決めても、そのアプリのウィンドウが1枚しか見つかっていないときは
--- 候補数が並び、記述順次第で入れ替わる。
--- まずタイトル/パターン一致で割り当て、残りを同 bundleID のフォールバックで埋める。
+-- レイアウトのスロットにウィンドウを割り当てる。結果は slot.entries（配列）に入れる。
+-- 1つの記述は、bundleID と title/titlePattern が一致するウィンドウを全て取る。
+-- title の完全一致でも同じタイトルのウィンドウは複数ありうるし、
+-- '.*' のようなパターンなら当然複数当たるので、記述とウィンドウは 1 対 n で対応する。
+-- bundleID だけの一致は使わない。使うと、パターンを書き損じたウィンドウが
+-- 無関係な記述に吸い付き、意図しない位置へ動かされる。
+--
+-- 1つのウィンドウが複数の記述に当たるときの行き先は、次の順で決める。
+--   1) 自由度が低い（具体的な）記述。'.*' が名指しの記述の取り分を奪わないため
+--   2) 割り当て済みが少ない記述。キャプチャは 1 対 1 で記録するので、同じタイトルの
+--      ウィンドウが別 Space にあると同じ内容の記述が複数できる。先勝ちにすると
+--      全部が先頭の記述へ寄り、キャプチャした配置を復元できなくなる
+--   3) レイアウトの記述順（画面は UUID 昇順）
 local function assignWindows(slots, pool)
-  local remaining = {}
-  for i, e in ipairs(pool) do remaining[i] = e end
+  -- 後段が #slot.entries を無条件に読めるよう、noSpace のスロットも初期化する
+  for _, slot in ipairs(slots) do slot.entries = {} end
 
-  -- desc に当たる remaining の添字一覧。byTitle=false なら bundleID だけで見る
-  local function candidates(desc, byTitle)
-    local list = {}
-    for i, entry in ipairs(remaining) do
-      if entry.desc.bundleID == desc.bundleID
-         and (not byTitle or titleMatches(desc, entry.desc.title)) then
-        table.insert(list, i)
-      end
-    end
-    return list
-  end
-
-  local function assignPass(byTitle)
-    while true do
-      local bestSlot, bestCount, bestSpec, bestIdx
-      for _, slot in ipairs(slots) do
-        if not slot.entry and not slot.noSpace then
-          local c = candidates(slot.desc, byTitle)
-          if #c > 0 then
-            local spec = descSpecificity(slot.desc)
-            -- 候補が少ない順。同数なら自由度が低い記述を優先し、
-            -- それも同じならレイアウト順で先のスロットを取る。
-            -- 候補数だけで決めると、プールに1枚しか無いときに
-            -- '.*' と '^SpaceSaver.spoon – ' が並び、記述順次第で入れ替わる
-            if not bestCount or #c < bestCount
-               or (#c == bestCount and spec > bestSpec) then
-              bestSlot, bestCount, bestSpec, bestIdx = slot, #c, spec, c[1]
-            end
-          end
+  for _, entry in ipairs(pool) do
+    local best, bestSpec
+    for _, slot in ipairs(slots) do
+      if not slot.noSpace
+         and slot.desc.bundleID == entry.desc.bundleID
+         and titleMatches(slot.desc, entry.desc.title) then
+        local spec = descSpecificity(slot.desc)
+        if not best or spec > bestSpec
+           or (spec == bestSpec and #slot.entries < #best.entries) then
+          best, bestSpec = slot, spec
         end
       end
-      if not bestSlot then return end
-      bestSlot.entry     = table.remove(remaining, bestIdx)
-      bestSlot.matchKind = byTitle and "title" or "bundle"
     end
+    if best then table.insert(best.entries, entry) end
   end
-
-  assignPass(true)
-  assignPass(false)
 end
 
 -- desc のタイトル指定 (pattern または title) と bundleID を "[key]=[val] bundleID=[...]" で返す
@@ -698,8 +661,11 @@ local function collectExistingEntries(data)
 end
 
 -- 実ウィンドウ actual に一致する既存エントリを取り出す。
--- 復元時と違い bundleID だけのフォールバックは使わない。
+-- 復元と同じく bundleID だけのフォールバックは使わない。
 -- 使うと titlePattern が無関係なウィンドウに吸い付き、誤った紐づけのまま保存されてしまう。
+-- 復元は 1 つの記述に一致する全ウィンドウを配置するが、こちらは実ウィンドウ 1 枚ごとに
+-- エントリを 1 つ消費する。同じ記述を複数のウィンドウで共有すると、
+-- どのウィンドウの frame を書き戻すのか決められない
 local function takeExistingEntry(actual, entries)
   for i, e in ipairs(entries) do
     if e.desc.bundleID == actual.bundleID and titleMatches(e.desc, actual.title) then
@@ -755,7 +721,7 @@ local function poolEntry(win, ignoreRules)
   local desc = windowDescriptor(win)
   if not desc then return nil end
 
-  -- 無視対象はプールに載せない。載せると bundleID だけのフォールバック照合で
+  -- 無視対象はプールに載せない。載せると '.*' のような広いパターンに一致して
   -- 別のエントリに割り当てられ、意図しない位置へ動かされる
   if isIgnored(ignoreRules, desc.bundleID, desc.title) then return nil end
 
@@ -786,13 +752,22 @@ local function buildPool(ignoreRules)
   return pool
 end
 
--- レイアウト中の記述をプールで賄えるか調べ、賄えなかった記述を返す。
+-- レイアウト中の記述をプールで賄えるか調べ、1枚も一致しなかった記述を返す。
 -- 配置と同じ割り当て規則を使うので、結果は実際の配置と一致する。
+-- ただし一致するのはスロットの列挙順を配置側と揃えている限りで、
+-- 順序が違うと自由度が同点のウィンドウの行き先が食い違う。
+-- 配置側 (placeWindows) は screenPlans を UUID 昇順で作るので、こちらも合わせる。
+-- なお、実 Space が足りず置き場所が無い記述 (noSpace) の区別はこちらには無いため、
+-- 「賄える」と数えた記述が配置側では未配置になることはある
 local function unmatchedDescriptors(pool, data)
   local slots = {}
-  for uuid, screenData in pairs(data.screens) do
+  local uuids = {}
+  for uuid in pairs(data.screens) do table.insert(uuids, uuid) end
+  table.sort(uuids)
+
+  for _, uuid in ipairs(uuids) do
     if hs.screen.find(uuid) then
-      for _, sp in ipairs(screenData.spaces or {}) do
+      for _, sp in ipairs(data.screens[uuid].spaces or {}) do
         for _, desc in ipairs(sp.windows or {}) do
           -- ignore に一致する記述は意図的に配置しないので、取りこぼしとして数えない
           -- （次のキャプチャで削除される）
@@ -808,7 +783,7 @@ local function unmatchedDescriptors(pool, data)
 
   local missing = {}
   for _, slot in ipairs(slots) do
-    if not slot.entry then table.insert(missing, slot.desc) end
+    if #slot.entries == 0 then table.insert(missing, slot.desc) end
   end
   return missing
 end
@@ -1093,9 +1068,11 @@ local function restoreCurrentConfig()
   local function placeWindows(pool)
     -- ① 配置先（スロット）をレイアウト順に集める
     local slots = {}
-    -- 並べ替えのため、レイアウト上の何番目の Space に全画面化したかを控える
+    -- 並べ替えのため、Space 列の何番目に全画面化したかを控える
     local fsPlacements = {}
-    for _, plan in ipairs(screenPlans) do
+    -- 画面ごとの fullscreen スロットをレイアウト順に控える（②の後で一致数を数えるため）
+    local fsSlotsByPlan = {}
+    for planIdx, plan in ipairs(screenPlans) do
       -- user Space のみを並び順どおりに抽出（fullscreen を除外）。
       -- レイアウトの user Space 配列は、この userSpaceIDs に順番で対応する。
       local userSpaceIDs = {}
@@ -1103,13 +1080,15 @@ local function restoreCurrentConfig()
         if not spaceIsFullscreen(sid) then table.insert(userSpaceIDs, sid) end
       end
       local userIdx = 0
+      local fsSlots = {}
+      fsSlotsByPlan[planIdx] = fsSlots
 
-      for spIdx, sp in ipairs(plan.spaces) do
+      for _, sp in ipairs(plan.spaces) do
         if (sp.type or "user") == "fullscreen" then
           for _, desc in ipairs(sp.windows or {}) do
-            table.insert(slots, {
-              kind = "fullscreen", desc = desc, uuid = plan.uuid, spaceIdx = spIdx,
-            })
+            local slot = { kind = "fullscreen", desc = desc, uuid = plan.uuid }
+            table.insert(fsSlots, slot)
+            table.insert(slots, slot)
           end
         else
           userIdx = userIdx + 1
@@ -1127,34 +1106,65 @@ local function restoreCurrentConfig()
       end
     end
 
-    -- ② ウィンドウを割り当てる。
-    -- 候補が少ない記述から先に確定させる。'.*' のように広く当たるパターンを
-    -- 先に処理すると、特定のウィンドウを名指しする記述の取り分を奪ってしまう。
+    -- ② ウィンドウを割り当てる。1つの記述には、一致するウィンドウが全て入る。
+    -- 1つのウィンドウが複数の記述に当たるときは、具体的な記述を優先する。
+    -- '.*' のように広く当たるパターンが、名指しの記述の取り分を奪わないため。
     assignWindows(slots, pool)
 
-    -- ③ レイアウト順にタスク化する
+    -- ②' 全画面化するウィンドウの目標位置を、画面ごとの Space 列の通し番号で決める。
+    -- user Space は windows が空でも1枠を占める。fullscreen の記述は一致した枚数ぶん
+    -- 連続して枠を取り、1枚も一致しなければ枠を取らない（その Space は作られないため）。
+    -- スロット列ではなく plan.spaces を直接たどるのは、windows が空の user Space が
+    -- スロットを1つも作らず、スロット経由で数えると位置がずれるため
+    for planIdx, plan in ipairs(screenPlans) do
+      local fsSlots = fsSlotsByPlan[planIdx]
+      local fsIdx, pos = 0, 0
+      for _, sp in ipairs(plan.spaces) do
+        if (sp.type or "user") == "fullscreen" then
+          -- スロットは①でこの順に作ったので、添字を進めながら対応させる
+          for _ = 1, #(sp.windows or {}) do
+            fsIdx = fsIdx + 1
+            local slot = fsSlots[fsIdx]
+            slot.fsIndices = {}
+            for k = 1, #slot.entries do
+              pos = pos + 1
+              slot.fsIndices[k] = pos
+            end
+          end
+        else
+          pos = pos + 1
+        end
+      end
+    end
+
+    -- ③ レイアウト順にタスク化する。1つの記述に複数一致していれば、その枚数ぶん作る。
+    -- frame は同じ値を全てのウィンドウに適用するので、複数枚は重なって置かれる
     local tasks = {}
     for _, slot in ipairs(slots) do
       if slot.noSpace then
         print(string.format("未配置 %s actualTitle=[] reason=[対象Spaceなし (userSpace#%d)]",
           descKeyLabel(slot.desc), slot.userIdx))
-      elseif not slot.entry then
+      elseif #slot.entries == 0 then
         print(string.format("未配置 %s actualTitle=[] reason=[該当ウィンドウなし]",
           descKeyLabel(slot.desc)))
       elseif slot.kind == "fullscreen" then
-        table.insert(tasks, {
-          kind = "fullscreen",
-          win = slot.entry.win, desc = slot.desc,
-          actualTitle = slot.entry.desc.title, matchKind = slot.matchKind,
-          uuid = slot.uuid, spaceIdx = slot.spaceIdx,
-        })
+        for k, entry in ipairs(slot.entries) do
+          table.insert(tasks, {
+            kind = "fullscreen",
+            win = entry.win, desc = slot.desc,
+            actualTitle = entry.desc.title,
+            uuid = slot.uuid, fsIndex = slot.fsIndices[k],
+          })
+        end
       else
-        table.insert(tasks, {
-          kind = "space",
-          win = slot.entry.win, desc = slot.desc,
-          actualTitle = slot.entry.desc.title, matchKind = slot.matchKind,
-          sid = slot.sid, uuid = slot.uuid, userIdx = slot.userIdx,
-        })
+        for _, entry in ipairs(slot.entries) do
+          table.insert(tasks, {
+            kind = "space",
+            win = entry.win, desc = slot.desc,
+            actualTitle = entry.desc.title,
+            sid = slot.sid, uuid = slot.uuid, userIdx = slot.userIdx,
+          })
+        end
       end
     end
 
@@ -1203,10 +1213,9 @@ local function restoreCurrentConfig()
       if t.kind == "fullscreen" then
         spaceMove.makeFullScreen(t.win, t.uuid, t.desc.frame, function(method)
           if method ~= "none" then spacesTouched = true end
-          table.insert(fsPlacements, { uuid = t.uuid, index = t.spaceIdx, win = t.win })
-          local note = t.matchKind == "bundle" and " (bundleIDのみ一致)" or ""
-          print(string.format("配置 %s actualTitle=[%s] -> screen=[%s] fullscreen=[%s]%s",
-            descKeyLabel(t.desc), t.actualTitle, t.uuid, method, note))
+          table.insert(fsPlacements, { uuid = t.uuid, index = t.fsIndex, win = t.win })
+          print(string.format("配置 %s actualTitle=[%s] -> screen=[%s] fullscreen=[%s]",
+            descKeyLabel(t.desc), t.actualTitle, t.uuid, method))
           runTask(i + 1)
         end)
       elseif t.kind == "space" then
@@ -1216,11 +1225,10 @@ local function restoreCurrentConfig()
             if method == "drag" or method == "mc" or method == "failed" then
               spacesTouched = true
             end
-            local note = t.matchKind == "bundle" and " (bundleIDのみ一致)" or ""
             print(string.format(
-              "配置 %s actualTitle=[%s] -> screen=[%s] userSpace#%d spaceID=[%s] move=[%s]%s",
+              "配置 %s actualTitle=[%s] -> screen=[%s] userSpace#%d spaceID=[%s] move=[%s]",
               descKeyLabel(t.desc), t.actualTitle, t.uuid, t.userIdx,
-              tostring(t.sid), method, note))
+              tostring(t.sid), method))
             runTask(i + 1)
           end)
       else
@@ -1231,19 +1239,22 @@ local function restoreCurrentConfig()
     runTask(1)
   end
 
-  -- 照合できなかった記述のために、Space を表示してウィンドウを拾い直す。
+  -- まだ評価していないウィンドウを、Space を表示して拾う。
   -- macOS は非可視 Space のウィンドウを AX に出さないため、その Space を表示するまで
   -- hs.window.get は nil を返す。表示する以外に取得する手段がない。
-  -- 全 Space を舐めると画面が何度も切り替わるので、次の3点で回数を抑える。
+  --
+  -- 1つの記述に一致する全ウィンドウを配置するので、「全ての記述が1枚以上一致した」ことは
+  -- 巡回を終える根拠にならない。まだ見ていない Space に n+1 枚目がいるかもしれない。
+  -- そこで、未評価のウィンドウを持つ Space は全て見る。回数は次の2点で抑える。
   --   1. アクティブな Space は既にプールへ入っているので飛ばす
   --   2. 既に評価したウィンドウしか無い Space は飛ばす。所属ウィンドウの ID は
   --      表示しなくても読めるので、表示する価値があるかを先に判断できる
-  --   3. 照合できない記述が無くなった時点で打ち切る
-  -- 3 が早く効くよう、照合できない記述を置くモニタの Space から先に見る。
-  local function rescanSpaces(pool, onDone)
-    local unmet = missingButRunning(unmatchedDescriptors(pool, data))
-    if #unmet == 0 then onDone(pool); return end
-
+  -- 評価済みは Hammerspoon のリロードまで覚えているので、実際に巡回が走るのは
+  -- リロード後の初回と、非可視 Space に新しいウィンドウが増えたときだけになる。
+  -- 巡回順は、照合できない記述を置くモニタを先にする。取りこぼしの解消を早く見せるため。
+  -- unmet（1枚も一致しなかった記述のうちアプリが起動中のもの）は呼び出し側から受け取る。
+  -- 巡回するかどうかではなく、どのモニタから見るかにだけ使う
+  local function rescanSpaces(pool, unmet, onDone)
     -- 記述 -> それを置くモニタ。unmatchedDescriptors はレイアウト上の desc を
     -- そのまま返すので、テーブルの同一性で引ける
     local descScreen = {}
@@ -1280,11 +1291,15 @@ local function restoreCurrentConfig()
     end
 
     if #worklist == 0 then
-      print("SpaceSaver: 未表示の Space が無いため、これ以上ウィンドウを拾えません")
+      -- 巡回する Space が無いのが通常。照合できない記述が残っているときだけ、
+      -- これ以上打つ手が無いことを知らせる
+      if #unmet > 0 then
+        print("SpaceSaver: 未評価の Space が無いため、これ以上ウィンドウを拾えません")
+      end
       onDone(pool)
       return
     end
-    print(string.format("SpaceSaver: %d 件の Space を表示してウィンドウを拾い直します", #worklist))
+    print(string.format("SpaceSaver: %d 件の Space を表示して未評価のウィンドウを拾います", #worklist))
 
     local seen = {}
     for _, e in ipairs(pool) do
@@ -1298,7 +1313,6 @@ local function restoreCurrentConfig()
       local sid = worklist[i]
       pcall(hs.spaces.gotoSpace, sid)
       later(CAPTURE_SETTLE, function()
-        local added = 0
         local wok, winIDs = pcall(hs.spaces.windowsForSpace, sid)
         if wok and winIDs then
           for _, wid in ipairs(winIDs) do
@@ -1309,18 +1323,9 @@ local function restoreCurrentConfig()
               seen[wid] = true
               local win = hs.window.get(wid)
               local entry = win and poolEntry(win, data.ignoreEffective)
-              if entry then
-                table.insert(pool, entry)
-                added = added + 1
-              end
+              if entry then table.insert(pool, entry) end
             end
           end
-        end
-        -- 拾えたときだけ再判定する。プールが変わっていなければ結果も変わらない
-        if added > 0 and #missingButRunning(unmatchedDescriptors(pool, data)) == 0 then
-          print(string.format("SpaceSaver: %d 件目で全ての記述が照合できたため巡回を打ち切ります", i))
-          onDone(pool)
-          return
         end
         step(i + 1)
       end)
@@ -1333,18 +1338,24 @@ local function restoreCurrentConfig()
   -- アプリが起動中なのに照合できなかった記述は、ウィンドウ列挙の取りこぼしか
   -- レイアウトの記述ずれのどちらかなので、判断材料としてログに出す。
   local function buildPoolAndPlace()
-    local pool     = buildPool(data.ignoreEffective)
-    local unmet    = missingButRunning(unmatchedDescriptors(pool, data))
+    local pool  = buildPool(data.ignoreEffective)
+    local unmet = missingButRunning(unmatchedDescriptors(pool, data))
 
     if #unmet > 0 then
       print(string.format("SpaceSaver: アプリ起動中だが照合できない記述が %d 件あります", #unmet))
       for _, desc in ipairs(unmet) do
         print("  " .. descKeyLabel(desc))
       end
-      if obj.rescanSpacesIfIncomplete then
-        rescanSpaces(pool, placeWindows)
-        return
-      end
+    end
+
+    -- 未評価のウィンドウがあれば拾いに行く。照合できない記述の有無では判断しない。
+    -- 記述に一致するウィンドウが1枚見つかっていても、未評価の Space に
+    -- 同じ記述に一致する2枚目がいるかもしれない
+    if obj.rescanSpacesIfIncomplete then
+      rescanSpaces(pool, unmet, placeWindows)
+      return
+    end
+    if #unmet > 0 then
       print("SpaceSaver: rescanSpacesIfIncomplete を有効にすると Space を表示して拾い直します")
     end
 

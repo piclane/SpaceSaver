@@ -101,7 +101,7 @@
         },
         "windows": {
           "type": "array",
-          "description": "このSpaceに配置するウィンドウのリスト。リストア時に bundleID + title/titlePattern で照合する。",
+          "description": "このSpaceに配置するウィンドウのリスト。リストア時に bundleID + title/titlePattern で照合し、一致したウィンドウを全て配置する（1記述=nウィンドウ）。bundleIDだけの一致は使わない。",
           "items": { "$ref": "#/$defs/window" }
         }
       }
@@ -117,15 +117,15 @@
         },
         "title": {
           "type": "string",
-          "description": "ウィンドウタイトルの完全一致文字列。キャプチャ時に自動入力。titlePatternがあればそちらが優先される。"
+          "description": "ウィンドウタイトルの完全一致文字列。キャプチャ時に自動入力。titlePatternがあればそちらが優先される。同じタイトルのウィンドウが複数あれば、その全てが対象になる。"
         },
         "titlePattern": {
           "type": "string",
-          "description": "ウィンドウタイトルのLuaパターン (例: '^MyApp - ')。可変タイトルのアプリに手動で追記する。titleより優先される。Luaパターン記法（PCREとは一部異なる）。"
+          "description": "ウィンドウタイトルのLuaパターン (例: '^MyApp - ')。可変タイトルのアプリに手動で追記する。titleより優先される。パターンに一致するウィンドウが全て対象になる。Luaパターン記法（PCREとは一部異なる）。"
         },
         "frame": {
           "$ref": "#/$defs/frame",
-          "description": "ウィンドウの位置とサイズ（復元に使用）。キャプチャ時に自動入力。"
+          "description": "ウィンドウの位置とサイズ（復元に使用）。キャプチャ時に自動入力。複数のウィンドウが一致した場合は全てに同じ値を適用するため、重なって配置される。"
         },
         "note": {
           "type": "string",
