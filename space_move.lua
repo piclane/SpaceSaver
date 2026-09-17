@@ -40,6 +40,11 @@
                    "enter"    同じモニタ上でフルスクリーン化した
                    "rescreen" 別モニタから移して入れ直した
 
+    M.beginRestore()
+      1 回の復元を始める前に呼ぶ。アプリごとに積み上げた「この手段は効かない」の
+      記録を捨てる。効かないという判断は一時的な事情でも下るため、持ち越すと
+      Hammerspoon を再起動するまでそのアプリの移動手段が戻らない
+
     M.moveWindowToSpace(win, sid, frame, hotkeys, done)
       win     : hs.window
       sid     : 目的 Space ID
@@ -51,8 +56,8 @@
                 "drag"        タイトルバーを掴むドラッグ方式で移動
                 "mc"          Mission Control 方式で移動（space_mc.lua）
                 "failed"      移動できずフレーム補正のみ
-                "unsupported" このアプリでは移動できないと判明済みのため
-                              試行せずフレーム補正のみ
+                "unsupported" この復元のあいだに、そのアプリではどの手段も
+                              効かないと判明しているため、試行せずフレーム補正のみ
 --]]
 
 local M = {}
@@ -95,6 +100,14 @@ local VERIFY_DELAY = 0.2   -- 純正 API 実行後、windowSpaces を検算す�
 -- そのアプリの移動を諦めさせてしまうので、真になるまで見に行く
 local SETTLE_POLL    = 0.05 -- 所属 Space の反映を見に行く間隔（秒）
 local SETTLE_TIMEOUT = 1.5  -- 同上の上限（秒）
+-- hs.spaces.gotoSpace は Mission Control を開いて Space のサムネイルを押す実装なので、
+-- 戻った直後はまだ Mission Control の描画が残っている。その状態で座標の最前面を調べると
+-- Dock の要素が返り、ウィンドウを掴む点が 1 つも見つからない。消えるまで待ってから掴む
+local MC_GONE_TIMEOUT = 2.0  -- Mission Control が消えるのを待つ上限（秒）
+-- 掴む点が 1 つも見つからないとき、すぐ諦めずにやり直す。Mission Control の後始末や、
+-- 別モニタへ寄せた直後の再描画で、一時的に座標判定が通らないことがある
+local GRAB_RETRY      = 4    -- 掴む点を選び直す回数
+local GRAB_RETRY_WAIT = 0.25 -- 選び直す間隔（秒）
 local TIMEOUT_BASE = 3.0   -- 安全タイムアウトの固定分（秒）。可変分は Space 移動段数に比例
 
 -- フルスクリーン切替はアニメーションを伴うため、各段で収まるのを待つ
@@ -137,13 +150,19 @@ local nativeMoveWorks = nil
 -- 掴めてもウィンドウが Space の切替について来ないアプリがありうる。
 -- アプリ単位で連続失敗を数え、規定回数に達したらそのアプリでは以降試さない。
 -- 全体で1つのフラグにすると、1つのアプリの失敗で他のアプリまで諦めてしまう。
+-- 記録は M.beginRestore で復元ごとに捨てる。一時的な事情で下した判断を持ち越すと、
+-- Hammerspoon を再起動するまでそのアプリの移動手段が戻らない。
 local dragFailures = {}   -- bundleID -> 連続失敗回数
 local dragBlocked  = {}   -- bundleID -> true なら以降ドラッグを試さない
 local DRAG_GIVEUP  = 3    -- 同じアプリでも成否が揺れることがあるので少し余裕を持たせる
 
--- Mission Control 方式も効かなかったアプリ。両方だめなら移動を諦める
+-- Mission Control 方式も効かなかったアプリ。両方だめなら移動を諦める。
+-- ただし数えるのは、そのウィンドウに固有の失敗（サムネイルが無い、落としても
+-- 移動していない）だけである。Mission Control 自体が開かないような失敗は
+-- どのアプリでも同じように起きるので、数えるとアプリのせいにしたことになる。
+-- 記録は M.beginRestore で復元ごとに捨てる
 local mcFailures = {}     -- bundleID -> 連続失敗回数
-local mcBlocked  = {}     -- bundleID -> true なら以降 Mission Control を試さない
+local mcBlocked  = {}     -- bundleID -> true ならこの復元では以降 Mission Control を試さない
 
 -- ドラッグ方式が効かず Mission Control 方式で移せたアプリ。
 -- 効かないと分かった時点で切り替える。連続失敗を数えてから切り替えたのでは、
@@ -219,6 +238,16 @@ end
 local function waitForSpace(win, targetSid, cb)
   waitUntil(function() return indexOf(windowSpacesOf(win), targetSid) ~= nil end,
     SETTLE_TIMEOUT, cb)
+end
+
+-- 指定モニタの Mission Control が閉じきるのを待って cb を呼ぶ。
+-- 閉じたと確かめられないまま上限に達した場合も cb を呼ぶ。待ち続けると復元全体が止まる
+local function waitMissionControlGone(screenUUID, cb)
+  local scr = hs.screen.find(screenUUID)
+  local screenID = scr and scr:id()
+  if not screenID then cb(); return end
+  waitUntil(function() return not spaceMC.isOpen(screenID) end, MC_GONE_TIMEOUT,
+    function() cb() end)
 end
 
 -- frame が指定されていればウィンドウに適用する
@@ -478,7 +507,8 @@ end
 -- ドラッグ方式 Space 移動
 -- ============================================================
 
--- ドラッグ失敗をアプリ単位で記録する。連続で規定回数に達したらそのアプリを諦める
+-- ドラッグ失敗をアプリ単位で記録する。連続で規定回数に達したら、
+-- この復元のあいだはそのアプリでドラッグ方式を試さない
 local function noteDragFailure(win, reason)
   local bid = bundleIDOf(win)
   dragFailures[bid] = (dragFailures[bid] or 0) + 1
@@ -486,8 +516,8 @@ local function noteDragFailure(win, reason)
     bid, reason, dragFailures[bid], DRAG_GIVEUP))
   if dragFailures[bid] >= DRAG_GIVEUP and not dragBlocked[bid] then
     dragBlocked[bid] = true
-    print(string.format("SpaceSaver(space_move): %s は Space をまたぐ移動に対応できないと判断しました。"
-      .. "以降このアプリではフレーム補正のみ行います", bid))
+    print(string.format("SpaceSaver(space_move): %s はドラッグ方式では移せないと判断しました。"
+      .. "この復元のあいだは、以降このアプリで Mission Control 方式だけを使います", bid))
   end
 end
 
@@ -676,30 +706,55 @@ local function dragWindowToSpace(win, targetSid, frame, hotkeys, done)
       return valid[(rot % #valid) + 1]
     end
 
-    -- 現在 Space に移動し、ウィンドウを本当に前面へ出してから掴む。
+    -- 掴む点を選ぶ。1 つも見つからないときは、少し待って選び直す。
+    -- Mission Control の後始末や、別モニタへ寄せた直後の再描画の最中は、
+    -- 座標の最前面が Dock の要素になり、どの候補も自分のものと判定できない。
+    -- この状態は数百ミリ秒で解消するので、一度の判定で諦めると取り逃がす
+    local function pickGrabPointRetrying(attempt, cb)
+      local c = pickGrabPoint()
+      if c then cb(c); return end
+      if attempt >= GRAB_RETRY then cb(nil); return end
+      later(GRAB_RETRY_WAIT, function() pickGrabPointRetrying(attempt + 1, cb) end)
+    end
+
+    -- ウィンドウを本当に前面へ出してから掴む。
     -- 候補は前面化のあとで選ぶ（位置と信号ボタンの配置が確定してから読む）
-    pcall(hs.spaces.gotoSpace, curSid)
-    later(GOTO_DELAY, function()
+    local function grabAndCross()
       bringToFront(win, 1, function()
-        local c = pickGrabPoint()
-        if not c then
-          noteDragFailure(win, "掴める点が見つからない")
-          finish("failed"); return
-        end
+        pickGrabPointRetrying(1, function(c)
+          if not c then
+            noteDragFailure(win, string.format("掴める点が見つからない（%d 回試した）", GRAB_RETRY))
+            finish("failed"); return
+          end
 
-        local f  = win:frame()
-        local pt = hs.geometry.point(f.x + c.dx, f.y + c.dy)
-        hs.mouse.absolutePosition(pt)
-        hs.eventtap.event.newMouseEvent(
-          hs.eventtap.event.types.leftMouseDown, pt):post()
-        mouseIsDown = true
+          local f  = win:frame()
+          local pt = hs.geometry.point(f.x + c.dx, f.y + c.dy)
+          hs.mouse.absolutePosition(pt)
+          hs.eventtap.event.newMouseEvent(
+            hs.eventtap.event.types.leftMouseDown, pt):post()
+          mouseIsDown = true
 
-        later(DOWN_DELAY, function()
-          dragBy(pt, GRAB_DRAG_DX)
-          later(DRAG_DELAY, function() crossSpaces(c.dx, c.dy) end)
+          later(DOWN_DELAY, function()
+            dragBy(pt, GRAB_DRAG_DX)
+            later(DRAG_DELAY, function() crossSpaces(c.dx, c.dy) end)
+          end)
         end)
       end)
-    end)
+    end
+
+    -- 掴む前に、ウィンドウのいる Space を表示させる。
+    -- ただし既に表示中なら hs.spaces.gotoSpace を呼ばない。この関数は Mission Control を
+    -- 開いてサムネイルを押す実装なので、不要な場面で呼ぶと、自分が出した描画と
+    -- 掴む点の判定が競合する。別モニタから setFrame で寄せた直後がこれにあたる
+    local okActive, activeSid = pcall(hs.spaces.activeSpaceOnScreen, screenUUID)
+    if okActive and activeSid == curSid then
+      grabAndCross()
+    else
+      pcall(hs.spaces.gotoSpace, curSid)
+      waitMissionControlGone(screenUUID, function()
+        later(GOTO_DELAY, grabAndCross)
+      end)
+    end
   end
 
   -- ウィンドウが現在いる Space を、目的スクリーンの allSpaces から探す
@@ -791,14 +846,25 @@ local function spaceDistance(win, targetSid)
   return nil
 end
 
--- Mission Control 方式で移す。成否をログに残し、失敗はアプリ単位で数える
+-- Mission Control 方式で移す。成否をログに残す。
+-- 失敗をアプリ単位で数えるのは、そのウィンドウに固有の失敗のときだけにする。
+-- Mission Control が開かない、Space バーが出ないといった失敗はどのアプリでも
+-- 同じように起きるので、数えると、たまたまそのとき動かしていたアプリが
+-- Mission Control 方式を使えなくなってしまう
 local function missionControlMove(win, targetSid, frame, done)
   local bid = bundleIDOf(win)
-  spaceMC.moveWindowToSpace(win, targetSid, function(ok)
+  spaceMC.moveWindowToSpace(win, targetSid, function(ok, reason)
     applyFrame(win, frame)
     if ok then
       mcFailures[bid] = 0
       done("mc")
+      return
+    end
+    if reason ~= "window" then
+      print(string.format("SpaceSaver(space_move): %s の移動で Mission Control 方式が"
+        .. "働きませんでした。Mission Control 側の事情なので、%s の失敗としては数えません",
+        bid, bid))
+      done("failed")
       return
     end
     mcFailures[bid] = (mcFailures[bid] or 0) + 1
@@ -807,11 +873,25 @@ local function missionControlMove(win, targetSid, frame, done)
       bid, mcFailures[bid], DRAG_GIVEUP))
     if mcFailures[bid] >= DRAG_GIVEUP then
       mcBlocked[bid] = true
-      print(string.format("SpaceSaver(space_move): %s は Space をまたぐ移動に対応できないと"
-        .. "判断しました。以降このアプリではフレーム補正のみ行います", bid))
+      print(string.format("SpaceSaver(space_move): %s は Mission Control 方式では移せないと"
+        .. "判断しました。この復元のあいだは、以降このアプリでドラッグ方式だけを使います", bid))
     end
     done("failed")
   end)
+end
+
+--- 1 回の復元を始める前に呼ぶ。アプリごとに積み上げた「この手段は効かない」の記録を捨てる。
+--- 効かないという判断は、Mission Control の反応が遅い、別モニタへ寄せた直後で
+--- 再描画が終わっていない、といった一時的な事情でも下る。持ち越すと、
+--- Hammerspoon を再起動するまでそのアプリの移動手段が戻らない。
+--- 掴めた点 (grabPoints)、Mission Control 方式を優先すると分かったアプリ (mcPreferred)、
+--- 純正 API が効くかの判定 (nativeMoveWorks) は、やり直しても同じ結果になるので残す。
+function M.beginRestore()
+  dragFailures = {}
+  dragBlocked  = {}
+  mcFailures   = {}
+  mcBlocked    = {}
+  grabRotation = {}
 end
 
 --- win を targetSid の Space へ移動し、frame を適用する。

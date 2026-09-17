@@ -27,7 +27,19 @@
     M.moveWindowToSpace(win, targetSid, done)
       win       : hs.window
       targetSid : 目的 Space ID
-      done      : 完了コールバック。常に1回だけ done(成功したか) で呼ばれる
+      done      : 完了コールバック。常に1回だけ done(成功したか, 失敗の区分) で呼ばれる。
+                  失敗の区分は次の2つで、成功したときは nil を渡す。
+                    "mission-control" Mission Control が開かない、Space バーが出ない
+                                      など、どのアプリでも同じように起きる失敗
+                    "window"          サムネイルが無い、落としても移動していないなど、
+                                      そのウィンドウに固有の失敗
+                  呼び出し側は前者をアプリの失敗として数えてはいけない。数えると、
+                  Mission Control の一時的な不調で、そのアプリだけが移動手段を失う
+
+    M.isOpen(screenID)
+      screenID : hs.screen:id() が返す数値
+      指定モニタで Mission Control が開いているかを返す。
+      閉じきる前に画面の座標を調べると Dock の要素が返るため、待つ側が使う
 --]]
 
 local M = {}
@@ -127,6 +139,16 @@ local function mcDisplay(screenID)
     end
   end
   return nil
+end
+
+--- 指定モニタで Mission Control が開いているかを返す。
+--- hs.spaces.gotoSpace は Mission Control を開いて Space のサムネイルを押す実装なので、
+--- 戻った直後はまだ描画が残っている。その最中に座標の最前面の要素を調べると
+--- Dock の要素が返り、ウィンドウを掴む点が 1 つも見つからない。
+--- 待つ側がこの関数で消えたことを確かめてから進む。
+function M.isOpen(screenID)
+  local ok, d = pcall(mcDisplay, screenID)
+  return ok and d ~= nil
 end
 
 local function groupNamed(disp, ident)
@@ -284,7 +306,7 @@ function M.moveWindowToSpace(win, targetSid, done)
   local screenUUID = hs.spaces.spaceDisplay(targetSid)
   local screen     = screenUUID and hs.screen.find(screenUUID)
   if not screen then
-    later(0, function() done(false) end)
+    later(0, function() done(false, "mission-control") end)
     return
   end
   local ff       = screen:fullFrame()
@@ -292,14 +314,14 @@ function M.moveWindowToSpace(win, targetSid, done)
   local allSpaces = hs.spaces.spacesForScreen(screenUUID) or {}
   local targetIdx = indexOf(allSpaces, targetSid)
   if not targetIdx then
-    later(0, function() done(false) end)
+    later(0, function() done(false, "mission-control") end)
     return
   end
 
   local home = windowSpacesOf(win)[1]
 
   -- 中断してもマウスを押したままにしない。Mission Control も開いたままにしない
-  local function finish(ok)
+  local function finish(ok, reason)
     if called then return end
     called = true
     if mouseIsDown then
@@ -309,6 +331,14 @@ function M.moveWindowToSpace(win, targetSid, done)
       mouseIsDown = false
     end
     pcall(hs.spaces.closeMissionControl)
+    -- 落とせたつもりでも移動していないことがあるので、最後に所属 Space で検算する。
+    -- 検算で落ちた場合は、Mission Control は最後まで動いていたことになるため、
+    -- そのウィンドウに固有の失敗として報告する
+    local function report()
+      local arrived = indexOf(windowSpacesOf(win), targetSid) ~= nil
+      if ok and arrived then done(true); return end
+      done(false, reason or "window")
+    end
     pollUntil(function() return mcDisplay(screenID) == nil end, CLOSE_TIMEOUT, function()
       later(AFTER_CLOSE, function()
         -- 落とし損ねてフルスクリーンになっていたら戻す
@@ -316,10 +346,10 @@ function M.moveWindowToSpace(win, targetSid, done)
         pcall(function() isFS = win:isFullScreen() end)
         if isFS then
           pcall(function() win:setFullScreen(false) end)
-          later(1.0, function() done(ok and indexOf(windowSpacesOf(win), targetSid) ~= nil) end)
+          later(1.0, report)
           return
         end
-        done(ok and indexOf(windowSpacesOf(win), targetSid) ~= nil)
+        report()
       end)
     end)
   end
@@ -349,10 +379,10 @@ function M.moveWindowToSpace(win, targetSid, done)
     end
     if not thumb then
       print("SpaceSaver(space_mc): Mission Control にウィンドウのサムネイルが無い")
-      finish(false); return
+      finish(false, "window"); return
     end
     local wf = frameOf(thumb)
-    if not wf then finish(false); return end
+    if not wf then finish(false, "window"); return end
     local cx, cy = wf.x + wf.w / 2, wf.y + wf.h / 2
 
     -- Space バーは閉じていても名前は読める。座標だけが当てにならないので、
@@ -368,7 +398,7 @@ function M.moveWindowToSpace(win, targetSid, done)
     local wantName = names[targetIdx]
     if not wantName or wantName == "" then
       print("SpaceSaver(space_mc): 目的 Space のサムネイル名を読めない")
-      finish(false); return
+      finish(false, "mission-control"); return
     end
 
     -- 上端へ運ぶときの縦位置。サムネイルは画面の縮小版なのでバーの高さは
@@ -417,7 +447,7 @@ function M.moveWindowToSpace(win, targetSid, done)
             px, py, fmtFrame(frameOf(thumb)),
             tostring(nearIdx), nearD and string.format("%.1f", nearD) or "nil",
             tostring(nearD ~= nil and nearD < 30)))
-          finish(false); return
+          finish(false, "mission-control"); return
         end
 
         -- カーソルが目的の枠に入るまで寄せ直す。
@@ -431,7 +461,7 @@ function M.moveWindowToSpace(win, targetSid, done)
               print(string.format(
                 "SpaceSaver(space_mc): Space バーが展開しないため寄せ直せない"
                 .. " 枠=%s 必要条件 f.y>=%g", fmtFrame(f), ff.y))
-              finish(false); return
+              finish(false, "mission-control"); return
             end
             later(AIM_SETTLE, aim); return
           end
@@ -455,7 +485,7 @@ function M.moveWindowToSpace(win, targetSid, done)
               .. " 枠=%s カーソル=(%g,%g) 判定範囲 x=%g..%g y=%g..%g",
               fmtFrame(f), curX, curY,
               f.x + 8, f.x + f.w - 8, f.y + 8, f.y + f.h - 8))
-            finish(false); return
+            finish(false, "mission-control"); return
           end
           -- サムネイルの中心へ寄せ直す。バーが展開すると位置も大きさも変わるので、
           -- 掴む前に読んだ座標ではなく、そのつど読み直した枠を使う
@@ -492,7 +522,7 @@ function M.moveWindowToSpace(win, targetSid, done)
       -- Space 切替の直後などで効かないことがある。1度だけ送り直す
       if attempt < 2 then openThen(attempt + 1); return end
       print("SpaceSaver(space_mc): Mission Control が開かない")
-      finish(false)
+      finish(false, "mission-control")
     end)
   end
 
@@ -501,7 +531,7 @@ function M.moveWindowToSpace(win, targetSid, done)
   -- ウィンドウのいる Space を表示してから開く
   -- ------------------------------------------------------------
   if not home then
-    later(0, function() done(false) end)
+    later(0, function() done(false, "window") end)
     return
   end
   if indexOf(windowSpacesOf(win), targetSid) then

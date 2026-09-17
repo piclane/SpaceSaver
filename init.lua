@@ -973,6 +973,10 @@ local function restoreCurrentConfig()
   end
 
   busy = true
+  -- アプリごとに積み上げた「この手段は効かない」の記録を捨ててから始める。
+  -- 効かないという判断は、Mission Control の反応が遅いといった一時的な事情でも下る。
+  -- 持ち越すと、次の復元でも同じ手段を試さないまま失敗し続ける
+  spaceMove.beginRestore()
   print("SpaceSaver: [" .. basename(path) .. "] を復元開始")
   hs.alert.show("SpaceSaver: [" .. basename(path) .. "] 復元中…操作しないでください", 999)
 
