@@ -22,6 +22,11 @@
     - ドラッグ中はカーソルの位置に「新規フルスクリーン用の仮枠」が差し込まれ、
       Space サムネイルの番号が 1 つずれる。しかも仮枠はカーソルと一緒に動く。
       番号ではなく名前で狙う
+    - ウィンドウのサムネイルが持つタイトルは、ウィンドウサーバーのタイトルである。
+      hs.window:title() が返すアクセシビリティ用のタイトルとは、アプリによって違う。
+      Chrome は前者にページのタイトルだけを設定し、後者には「<ページのタイトル> -
+      固定済み - Google Chrome - <プロファイル名>」のようにタブの状態・アプリ名・
+      プロファイル名を足す。照合には前者を使う（hs.window.list で取得する）
 
   公開インターフェース:
     M.moveWindowToSpace(win, targetSid, done)
@@ -73,7 +78,9 @@ local DRAG_HOLD     = 0.03
 local AIM_STEPS     = 5    -- 狙いを直すときの分割数
 local AIM_TRIES     = 4    -- 狙いを直す回数の上限
 
-local TITLE_MATCH   = 12   -- サムネイルの照合に使うタイトルの先頭文字数
+-- ウィンドウサーバーのタイトルを取れないときに、アクセシビリティ用のタイトルと
+-- サムネイルのタイトルを照合する先頭のバイト数
+local TITLE_MATCH   = 12
 
 -- ============================================================
 -- ユーティリティ
@@ -120,6 +127,23 @@ local function windowSpacesOf(win)
   local ok, r = pcall(hs.spaces.windowSpaces, win)
   if ok and type(r) == "table" then return r end
   return {}
+end
+
+-- win のウィンドウサーバーのタイトルを返す（取れなければ nil）。
+-- hs.window.list は表示中のウィンドウしか返さないので、win のいる Space を表示してから呼ぶ。
+-- ほかのアプリのタイトルは、Hammerspoon に画面収録の許可がないと返らない
+local function serverTitleOf(win)
+  local ok, title = pcall(function()
+    local id = win:id()
+    local list = hs.window.list(true)
+    if type(list) ~= "table" then return nil end
+    for _, w in ipairs(list) do
+      if w.kCGWindowNumber == id then return w.kCGWindowName end
+    end
+    return nil
+  end)
+  if ok and type(title) == "string" and title ~= "" then return title end
+  return nil
 end
 
 -- ============================================================
@@ -206,6 +230,39 @@ local function spaceThumbNamed(disp, name)
     if titleOf(b) == name then return b end
   end
   return nil
+end
+
+-- win のサムネイルを返す。見つからなければ nil と、診断用の説明を返す。
+-- serverTitle（ウィンドウサーバーのタイトル）があれば完全一致で探す。一致が 2 枚以上あると
+-- どれが win か見分けられないので、別のウィンドウを移さないよう見つからなかったことにする。
+-- serverTitle が無ければアクセシビリティ用のタイトルと先頭 TITLE_MATCH バイトで照合する。
+-- 両者が一致するアプリでしか見つからない
+local function findWindowThumb(disp, win, serverTitle)
+  if serverTitle then
+    local found = {}
+    for _, b in ipairs(windowThumbs(disp)) do
+      if titleOf(b) == serverTitle then found[#found + 1] = b end
+    end
+    if #found == 1 then return found[1] end
+    if #found >= 2 then
+      return nil, string.format(
+        "同じタイトルのサムネイルが %d 枚あり、どれを移すか決められない 照合=[%s]（ウィンドウサーバー）",
+        #found, serverTitle)
+    end
+    return nil, string.format(
+      "Mission Control にウィンドウのサムネイルが無い 照合=[%s]（ウィンドウサーバー）", serverTitle)
+  end
+
+  local title = win:title() or ""
+  for _, b in ipairs(windowThumbs(disp)) do
+    local t = titleOf(b)
+    if t ~= "" and (t == title or t:sub(1, TITLE_MATCH) == title:sub(1, TITLE_MATCH)) then
+      return b
+    end
+  end
+  return nil, string.format(
+    "Mission Control にウィンドウのサムネイルが無い 照合=[%s]（アクセシビリティ。"
+    .. "ウィンドウサーバーのタイトルを取れなかった。画面収録の許可を確認すること）", title)
 end
 
 -- 点がサムネイルの枠の内側か
@@ -302,6 +359,7 @@ function M.moveWindowToSpace(win, targetSid, done)
   local called      = false
   local mouseIsDown = false
   local curX, curY  = 0, 0
+  local serverTitle = nil  -- サムネイルの照合に使う。Mission Control を開く前に取得する
 
   local screenUUID = hs.spaces.spaceDisplay(targetSid)
   local screen     = screenUUID and hs.screen.find(screenUUID)
@@ -369,16 +427,12 @@ function M.moveWindowToSpace(win, targetSid, done)
   -- Mission Control を開いてサムネイルを掴み、目的の Space へ落とす
   -- ------------------------------------------------------------
   local function grabAndDrop(disp)
-    local title = win:title() or ""
-    local thumb
-    for _, b in ipairs(windowThumbs(disp)) do
-      local t = titleOf(b)
-      if t ~= "" and (t == title or t:sub(1, TITLE_MATCH) == title:sub(1, TITLE_MATCH)) then
-        thumb = b; break
-      end
-    end
+    local thumb, why = findWindowThumb(disp, win, serverTitle)
     if not thumb then
-      print("SpaceSaver(space_mc): Mission Control にウィンドウのサムネイルが無い")
+      local seen = {}
+      for i, b in ipairs(windowThumbs(disp)) do seen[i] = titleOf(b) end
+      print(string.format("SpaceSaver(space_mc): %s [診断] 並んでいたサムネイル=[%s]",
+        why, table.concat(seen, " | ")))
       finish(false, "window"); return
     end
     local wf = frameOf(thumb)
@@ -501,6 +555,11 @@ function M.moveWindowToSpace(win, targetSid, done)
   -- Mission Control を開く
   -- ------------------------------------------------------------
   local function openThen(attempt)
+    -- ウィンドウサーバーのタイトルは、win のいる Space を表示している今のうちに取得する。
+    -- hs.window.list は表示中のウィンドウしか返さず、Mission Control を開いたあとも
+    -- そう扱われるかは確かめていない
+    serverTitle = serverTitle or serverTitleOf(win)
+
     -- 掴む前にカーソルをサムネイル群から離しておく。
     -- 開いた瞬間にサムネイルへ乗っていると、動かすまでホバーが付かない。
     -- 開く前はまだサムネイルの枠を読めないので画面の下端に置く。
