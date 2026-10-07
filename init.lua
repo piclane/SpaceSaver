@@ -624,6 +624,32 @@ local function descKeyLabel(desc)
   return string.format("%s=[%s] bundleID=[%s]", key, val, desc.bundleID or "")
 end
 
+-- desc.frame を uuid のモニタの内側に収めて返す（frame が無ければ nil）。
+-- キャプチャはウィンドウの frame をそのまま記録するので、モニタの端から 1px はみ出した
+-- frame が残ることがある。モニタの境目に接するウィンドウは、移動のあとで隣のモニタへ
+-- 入ってしまうことがある（hs.window.setFrameCorrectness の説明を参照）。
+-- 「ディスプレイごとに異なるSpaceを表示」の下では、はみ出した部分は隣のモニタに
+-- 表示されないので、収めても見えていた部分は減らない。
+-- 収める範囲はメニューバーと Dock を含むモニタ全体にする。Dock に重ねて置いた
+-- ウィンドウまで縮めないため。大きすぎる辺は、縦横比を保たずにその辺だけ縮める
+local function frameInsideScreen(desc, uuid)
+  local f = desc.frame
+  if not f then return nil end
+  local scr = hs.screen.find(uuid)
+  if not scr then return f end
+  local b = scr:fullFrame()
+  local w = math.min(f.w, b.w)
+  local h = math.min(f.h, b.h)
+  local x = math.max(b.x, math.min(f.x, b.x + b.w - w))
+  local y = math.max(b.y, math.min(f.y, b.y + b.h - h))
+  if x == f.x and y == f.y and w == f.w and h == f.h then return f end
+  print(string.format(
+    "SpaceSaver: %s の frame がモニタからはみ出しているため収めます"
+    .. " (x=%g y=%g w=%g h=%g) -> (x=%g y=%g w=%g h=%g)",
+    descKeyLabel(desc), f.x, f.y, f.w, f.h, x, y, w, h))
+  return { x = x, y = y, w = w, h = h }
+end
+
 -- ============================================================
 -- 無視リスト（トップレベル ignore）
 -- ============================================================
@@ -1218,8 +1244,9 @@ local function restoreCurrentConfig()
     local function runTask(i)
       if i > #tasks then arrangeFullscreenOrder(); return end
       local t = tasks[i]
+      local frame = frameInsideScreen(t.desc, t.uuid)
       if t.kind == "fullscreen" then
-        spaceMove.makeFullScreen(t.win, t.uuid, t.desc.frame, function(method)
+        spaceMove.makeFullScreen(t.win, t.uuid, frame, function(method)
           if method ~= "none" then spacesTouched = true end
           table.insert(fsPlacements, { uuid = t.uuid, index = t.fsIndex, win = t.win })
           print(string.format("配置 %s actualTitle=[%s] -> screen=[%s] fullscreen=[%s]",
@@ -1227,7 +1254,7 @@ local function restoreCurrentConfig()
           runTask(i + 1)
         end)
       elseif t.kind == "space" then
-        spaceMove.moveWindowToSpace(t.win, t.sid, t.desc.frame, obj.spaceSwitchHotkeys,
+        spaceMove.moveWindowToSpace(t.win, t.sid, frame, obj.spaceSwitchHotkeys,
           function(method)
             -- Space を切り替える手段はどれも、最後に元の Space へ戻す必要がある
             if method == "drag" or method == "mc" or method == "failed" then
