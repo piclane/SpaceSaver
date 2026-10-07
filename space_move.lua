@@ -846,6 +846,28 @@ local function spaceDistance(win, targetSid)
   return nil
 end
 
+-- win が targetSid と別のモニタにあれば、targetSid のモニタへ移してから cb を呼ぶ。
+-- Mission Control 方式は目的のモニタの Mission Control でサムネイルを探すが、
+-- Mission Control は各モニタに、そのモニタで表示中の Space のウィンドウしか並べない。
+-- 別のモニタにあるウィンドウはサムネイルが見つからず、必ず失敗する
+local function moveToTargetScreen(win, targetSid, frame, cb)
+  local uuid = hs.spaces.spaceDisplay(targetSid)
+  if not uuid then cb(); return end
+  local all = hs.spaces.spacesForScreen(uuid) or {}
+  local function onTarget()
+    for _, s in ipairs(windowSpacesOf(win)) do
+      if indexOf(all, s) then return true end
+    end
+    return false
+  end
+  if onTarget() then cb(); return end
+  -- レイアウトの frame が無い場合はモニタの矩形で代用する
+  applyFrame(win, frame or screenFrameOf(uuid))
+  -- setFrame で別モニタへ移した直後は windowSpaces がまだ元のモニタの Space を返す。
+  -- 入れ替わる前に進むと、Mission Control 方式が元のモニタの Space を表示しに行く
+  waitUntil(onTarget, SETTLE_TIMEOUT, function() cb() end)
+end
+
 -- Mission Control 方式で移す。成否をログに残す。
 -- 失敗をアプリ単位で数えるのは、そのウィンドウに固有の失敗のときだけにする。
 -- Mission Control が開かない、Space バーが出ないといった失敗はどのアプリでも
@@ -853,30 +875,39 @@ end
 -- Mission Control 方式を使えなくなってしまう
 local function missionControlMove(win, targetSid, frame, done)
   local bid = bundleIDOf(win)
-  spaceMC.moveWindowToSpace(win, targetSid, function(ok, reason)
-    applyFrame(win, frame)
-    if ok then
-      mcFailures[bid] = 0
-      done("mc")
+  moveToTargetScreen(win, targetSid, frame, function()
+    -- 移した先のモニタで表示中の Space がそのまま目的地だった場合は、
+    -- Mission Control を開く必要がない（Space が1つしかないモニタでは必ずこうなる）
+    if indexOf(windowSpacesOf(win), targetSid) then
+      applyFrame(win, frame)
+      later(0, function() done("none") end)
       return
     end
-    if reason ~= "window" then
-      print(string.format("SpaceSaver(space_move): %s の移動で Mission Control 方式が"
-        .. "働きませんでした。Mission Control 側の事情なので、%s の失敗としては数えません",
-        bid, bid))
+    spaceMC.moveWindowToSpace(win, targetSid, function(ok, reason)
+      applyFrame(win, frame)
+      if ok then
+        mcFailures[bid] = 0
+        done("mc")
+        return
+      end
+      if reason ~= "window" then
+        print(string.format("SpaceSaver(space_move): %s の移動で Mission Control 方式が"
+          .. "働きませんでした。Mission Control 側の事情なので、%s の失敗としては数えません",
+          bid, bid))
+        done("failed")
+        return
+      end
+      mcFailures[bid] = (mcFailures[bid] or 0) + 1
+      print(string.format(
+        "SpaceSaver(space_move): %s を Mission Control でも移動できません [%d/%d]",
+        bid, mcFailures[bid], DRAG_GIVEUP))
+      if mcFailures[bid] >= DRAG_GIVEUP then
+        mcBlocked[bid] = true
+        print(string.format("SpaceSaver(space_move): %s は Mission Control 方式では移せないと"
+          .. "判断しました。この復元のあいだは、以降このアプリでドラッグ方式だけを使います", bid))
+      end
       done("failed")
-      return
-    end
-    mcFailures[bid] = (mcFailures[bid] or 0) + 1
-    print(string.format(
-      "SpaceSaver(space_move): %s を Mission Control でも移動できません [%d/%d]",
-      bid, mcFailures[bid], DRAG_GIVEUP))
-    if mcFailures[bid] >= DRAG_GIVEUP then
-      mcBlocked[bid] = true
-      print(string.format("SpaceSaver(space_move): %s は Mission Control 方式では移せないと"
-        .. "判断しました。この復元のあいだは、以降このアプリでドラッグ方式だけを使います", bid))
-    end
-    done("failed")
+    end)
   end)
 end
 

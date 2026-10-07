@@ -30,7 +30,9 @@
 
   公開インターフェース:
     M.moveWindowToSpace(win, targetSid, done)
-      win       : hs.window
+      win       : hs.window。目的 Space と同じモニタに置いてから渡すこと。
+                  Mission Control は各モニタに、そのモニタで表示中の Space の
+                  ウィンドウしか並べないので、別のモニタにあるとサムネイルが見つからない
       targetSid : 目的 Space ID
       done      : 完了コールバック。常に1回だけ done(成功したか, 失敗の区分) で呼ばれる。
                   失敗の区分は次の2つで、成功したときは nil を渡す。
