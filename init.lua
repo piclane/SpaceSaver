@@ -221,6 +221,37 @@ local function basename(path)
   return path:match("[^/]+$") or path
 end
 
+-- キャプチャ・復元の進行状況を hs.alert で表示する。引数と戻り値は hs.alert.show と同じ。
+-- hs.alert の表示は、表示した時点の Space にだけ現れる。キャプチャと復元は Space を
+-- 切り替えながら進むため、そのままでは最初の Space を離れた時点でメッセージが見えなくなり、
+-- 処理中なのか終わったのかを見分けられない。そのため、全 Space と全画面表示のアプリの Space に
+-- 現れるように、表示に使うウィンドウの behavior を変更する。
+-- Mission Control を開いている間は、変更前と同じくメッセージは隠れる。
+local function showStatus(message, duration)
+  local id = hs.alert.show(message, duration)
+  -- hs.alert は表示に使う hs.drawing を返さないので、モジュール内部の一覧から UUID で探す。
+  -- 一覧の形が変わって見つからない場合も、メッセージ自体は表示される
+  pcall(function()
+    for _, entry in ipairs(hs.alert._visibleAlerts) do
+      if entry.UUID == id then
+        for _, d in ipairs(entry.drawings) do
+          d:setBehaviorByLabels({ "canJoinAllSpaces", "fullScreenAuxiliary" })
+        end
+        -- drawings[1] は背景の角丸四角形で、2 番目以降が文字である。
+        -- 全画面表示のアプリの Space へ切り替えると、同じレベルのウィンドウの重なり順が
+        -- 入れ替わり、文字が背景の下に隠れる。文字のレベルを背景より 1 つ上げて、
+        -- 重なり順に関係なく文字が背景より前面に表示されるようにする
+        local bgLevel = entry.drawings[1].canvas:level()
+        for i = 2, #entry.drawings do
+          entry.drawings[i]:setLevel(bgLevel + 1)
+        end
+        break
+      end
+    end
+  end)
+  return id
+end
+
 -- ============================================================
 -- 永続化（構成ごとファイル）
 -- ============================================================
@@ -847,7 +878,7 @@ function obj:capture()
     return
   end
   busy = true
-  hs.alert.show("SpaceSaver: キャプチャ開始…操作しないでください", 999)
+  showStatus("SpaceSaver: キャプチャ開始…操作しないでください", 999)
 
   local set = currentScreenSet()
 
@@ -936,7 +967,7 @@ function obj:capture()
 
       saveConfigFile(path, newScreens, localIgnore)
       busy = false
-      hs.alert.show("SpaceSaver: キャプチャ完了 [" .. basename(path) .. "]")
+      showStatus("SpaceSaver: キャプチャ完了 [" .. basename(path) .. "]")
       if updateMenu then updateMenu() end
     end)
   end
@@ -1008,7 +1039,7 @@ local function restoreCurrentConfig()
   -- 持ち越すと、次の復元でも同じ手段を試さないまま失敗し続ける
   spaceMove.beginRestore()
   print("SpaceSaver: [" .. basename(path) .. "] を復元開始")
-  hs.alert.show("SpaceSaver: [" .. basename(path) .. "] 復元中…操作しないでください", 999)
+  showStatus("SpaceSaver: [" .. basename(path) .. "] 復元中…操作しないでください", 999)
 
   -- 巡回後に戻すため、現在のアクティブ Space を記録（capture と同じ）
   local originalActive = {}
@@ -1076,7 +1107,7 @@ local function restoreCurrentConfig()
   local function announceDone()
     busy = false
     hs.alert.closeAll()
-    hs.alert.show("SpaceSaver: [" .. basename(path) .. "] 復元完了")
+    showStatus("SpaceSaver: [" .. basename(path) .. "] 復元完了")
     print("SpaceSaver: [" .. basename(path) .. "] 復元完了")
   end
 
