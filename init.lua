@@ -72,6 +72,8 @@
     - 再キャプチャは既存エントリを引き継ぐ。title/titlePattern が一致するウィンドウは
       そのエントリのまま現在のSpaceへ移し、frameだけ更新する。
       一致しなかった既存エントリは元の位置に残る（ignoreに一致するものは削除）
+    - cascade: true の記述は、一致したウィンドウを frame の位置から右下へずらして並べる。
+      再キャプチャではこの記述を書き換えず、一致したウィンドウも個別には記録しない
     - yq不在時はJSONフォールバック（space_layouts_<n>.json / space_common.json）で動作
     - 共通ファイルの ignore は照合にだけ使い、レイアウトファイルには書き戻さない。
       書き戻すと共通の規則が全レイアウトファイルに複製される
@@ -156,6 +158,12 @@ local SCREEN_STABLE_MAX   = 60.0 -- 秒: 落ち着くのを待つ上限
 local RESTORE_DELAY  = 1.0   -- 秒: Space追加/削除後、ウィンドウ移動までの待機
 local CAPTURE_SETTLE = 0.6   -- 秒: gotoSpace後、ウィンドウ取得までの待機
 local MC_STEP_DELAY  = 0.6   -- 秒: Space追加/削除(Mission Control操作)の各ステップ間の待機
+
+-- cascade の記述で、ウィンドウを 1 枚ごとに右下へずらす量（px）。
+-- macOS 26 の標準ウィンドウのタイトルバーの高さ（実測 32 px）以上にして、
+-- 奥のウィンドウのタイトルバーが手前のウィンドウに隠れないようにする。
+-- 32 px ちょうどではウィンドウどうしの間が狭いので、16 px の余白を足す
+local CASCADE_STEP = 48
 
 -- 各YAMLファイルの先頭に付与するヘッダを返す
 -- "screens:" は yq の変換出力がそのまま続くので、ここには含めない
@@ -681,6 +689,34 @@ local function frameInsideScreen(desc, uuid)
   return { x = x, y = y, w = w, h = h }
 end
 
+-- cascade の記述に一致した n 枚のウィンドウに当てる frame を、置く順に返す。
+-- base（frameInsideScreen でモニタに収めた frame）を起点に、1 枚ごとに右下へ
+-- CASCADE_STEP ずつずらす。次の 1 枚がモニタの右端か下端からはみ出すときは、
+-- 起点と同じ高さに戻り、直前の列の右端（その列の最後のウィンドウの右端）から次の列を始める。
+-- 次の列を置く幅も残っていなければ、起点から同じ並べ方を繰り返す。
+-- はみ出しの判定に使う範囲は frameInsideScreen と同じくモニタ全体にする。
+-- base はその範囲に収まっているので、各列の先頭の 1 枚は必ず置ける
+local function cascadeFrames(base, uuid, n)
+  local frames = {}
+  local scr = hs.screen.find(uuid)
+  if not scr then
+    for k = 1, n do frames[k] = base end
+    return frames
+  end
+  local b = scr:fullFrame()
+  local right, bottom = b.x + b.w, b.y + b.h
+  local x, y = base.x, base.y
+  for k = 1, n do
+    frames[k] = { x = x, y = y, w = base.w, h = base.h }
+    x, y = x + CASCADE_STEP, y + CASCADE_STEP
+    if x + base.w > right or y + base.h > bottom then
+      x, y = frames[k].x + base.w, base.y
+      if x + base.w > right then x = base.x end
+    end
+  end
+  return frames
+end
+
 -- ============================================================
 -- 無視リスト（トップレベル ignore）
 -- ============================================================
@@ -721,19 +757,25 @@ local function collectExistingEntries(data)
   return entries
 end
 
--- 実ウィンドウ actual に一致する既存エントリを取り出す。
+-- 実ウィンドウ actual に一致する既存エントリの添字を返す（無ければ nil）。
 -- 復元と同じく bundleID だけのフォールバックは使わない。
--- 使うと titlePattern が無関係なウィンドウに吸い付き、誤った紐づけのまま保存されてしまう。
+-- 使うと titlePattern が無関係なウィンドウに吸い付き、誤った紐づけのまま保存されてしまう
+local function findExistingEntry(actual, entries)
+  for i, e in ipairs(entries) do
+    if e.desc.bundleID == actual.bundleID and titleMatches(e.desc, actual.title) then
+      return i
+    end
+  end
+  return nil
+end
+
+-- 実ウィンドウ actual に一致する既存エントリを取り出す。
 -- 復元は 1 つの記述に一致する全ウィンドウを配置するが、こちらは実ウィンドウ 1 枚ごとに
 -- エントリを 1 つ消費する。同じ記述を複数のウィンドウで共有すると、
 -- どのウィンドウの frame を書き戻すのか決められない
 local function takeExistingEntry(actual, entries)
-  for i, e in ipairs(entries) do
-    if e.desc.bundleID == actual.bundleID and titleMatches(e.desc, actual.title) then
-      return table.remove(entries, i)
-    end
-  end
-  return nil
+  local i = findExistingEntry(actual, entries)
+  return i and table.remove(entries, i) or nil
 end
 
 -- spaceID がフルスクリーン型かどうか
@@ -899,6 +941,17 @@ function obj:capture()
                       or effectiveIgnore(nil)
   local leftover    = collectExistingEntries(existingData)
 
+  -- cascade の記述は leftover から分け、書き換えずに元の位置へ戻す。
+  -- frame はずらし始める起点として手書きした値で、実ウィンドウはそこからずれた位置にあるので、
+  -- 実測値で上書きすると起点が動く。また、一致したウィンドウをそれぞれ個別の記述として
+  -- 記録すると、次の復元ではウィンドウがその記述へ割り当てられ、ずらして並ばなくなる
+  local cascades = {}
+  for i = #leftover, 1, -1 do
+    if leftover[i].desc.cascade then
+      table.insert(cascades, 1, table.remove(leftover, i))
+    end
+  end
+
   -- 現在のアクティブSpaceを記録（キャプチャ後に戻すため）
   local originalActive = {}
   for uuid in pairs(set) do
@@ -943,22 +996,29 @@ function obj:capture()
         newScreens[uuid].metadata = screenMetadata(uuid, prevMeta)
       end
 
-      -- どのウィンドウにも一致しなかった既存エントリを元の位置に戻す。
-      -- アプリを閉じたままキャプチャしても手書き設定が消えないようにするため。
+      -- cascade の記述と、どのウィンドウにも一致しなかった既存エントリを元の位置に戻す。
+      -- 後者は、アプリを閉じたままキャプチャしても手書き設定が消えないようにするため。
       -- 実在するウィンドウの後ろに置き、復元時の照合で実在分が先に選ばれるようにする。
       -- ignore に一致するものは戻さない。これが不要になったエントリを掃除する手段になる。
+      -- 戻せなかったときは false を返す
+      local function putBack(e)
+        local spaces = newScreens[e.uuid] and newScreens[e.uuid].spaces
+        if isIgnored(ignoreRules, e.desc.bundleID, e.desc.title)
+           or not spaces or #spaces == 0 then
+          return false
+        end
+        -- 元の Space が無くなっていればその画面の末尾の Space に寄せる
+        table.insert(spaces[math.min(e.spaceIdx, #spaces)].windows, e.desc)
+        return true
+      end
+      for _, e in ipairs(cascades) do
+        if not putBack(e) then
+          print("SpaceSaver: cascade の記述を削除 " .. descKeyLabel(e.desc))
+        end
+      end
       local kept, dropped = 0, 0
       for _, e in ipairs(leftover) do
-        local spaces = newScreens[e.uuid] and newScreens[e.uuid].spaces
-        if isIgnored(ignoreRules, e.desc.bundleID, e.desc.title) then
-          dropped = dropped + 1
-        elseif spaces and #spaces > 0 then
-          -- 元の Space が無くなっていればその画面の末尾の Space に寄せる
-          table.insert(spaces[math.min(e.spaceIdx, #spaces)].windows, e.desc)
-          kept = kept + 1
-        else
-          dropped = dropped + 1
-        end
+        if putBack(e) then kept = kept + 1 else dropped = dropped + 1 end
       end
       if kept > 0 or dropped > 0 then
         print(string.format(
@@ -996,7 +1056,10 @@ function obj:capture()
                 if prev then
                   prev.desc.frame = desc.frame
                   table.insert(windows, prev.desc)
-                else
+                elseif isFS or not findExistingEntry(desc, cascades) then
+                  -- cascade の記述に一致するウィンドウは、その記述に含まれるので記録しない。
+                  -- ただしフルスクリーンのウィンドウは記録する。記録しないと、次の復元で
+                  -- cascade の記述の Space へ移され、フルスクリーンで復元されなくなる
                   table.insert(windows, desc)
                 end
               end
@@ -1203,7 +1266,8 @@ local function restoreCurrentConfig()
     end
 
     -- ③ レイアウト順にタスク化する。1つの記述に複数一致していれば、その枚数ぶん作る。
-    -- frame は同じ値を全てのウィンドウに適用するので、複数枚は重なって置かれる
+    -- frame は同じ値を全てのウィンドウに適用するので、複数枚は重なって置かれる。
+    -- cascade の記述だけは、ウィンドウごとに位置をずらす
     local tasks = {}
     for _, slot in ipairs(slots) do
       if slot.noSpace then
@@ -1213,19 +1277,36 @@ local function restoreCurrentConfig()
         print(string.format("未配置 %s actualTitle=[] reason=[該当ウィンドウなし]",
           descKeyLabel(slot.desc)))
       elseif slot.kind == "fullscreen" then
+        local frame = frameInsideScreen(slot.desc, slot.uuid)
         for k, entry in ipairs(slot.entries) do
           table.insert(tasks, {
             kind = "fullscreen",
-            win = entry.win, desc = slot.desc,
+            win = entry.win, desc = slot.desc, frame = frame,
             actualTitle = entry.desc.title,
             uuid = slot.uuid, fsIndex = slot.fsIndices[k],
           })
         end
       else
-        for _, entry in ipairs(slot.entries) do
+        local frame = frameInsideScreen(slot.desc, slot.uuid)
+        local entries, frames = slot.entries, nil
+        if slot.desc.cascade and frame then
+          -- ウィンドウ ID の昇順（開いた順）に並べる。ウィンドウが増えても、
+          -- 既にあるウィンドウの位置は変わらない。
+          -- 今の重なり順に合わせて並べることはできない。重なり順を読めるのは
+          -- 表示中の Space のウィンドウだけで、hs.window.filter のフォーカス順も、
+          -- 追跡を始めてからフォーカスされていないウィンドウは全て同じ値になる
+          entries = {}
+          for i, e in ipairs(slot.entries) do entries[i] = e end
+          table.sort(entries, function(a, b)
+            return (a.win:id() or 0) < (b.win:id() or 0)
+          end)
+          frames = cascadeFrames(frame, slot.uuid, #entries)
+        end
+        for k, entry in ipairs(entries) do
           table.insert(tasks, {
             kind = "space",
-            win = entry.win, desc = slot.desc,
+            win = entry.win, desc = slot.desc, frame = frames and frames[k] or frame,
+            raise = (frames ~= nil),
             actualTitle = entry.desc.title,
             sid = slot.sid, uuid = slot.uuid, userIdx = slot.userIdx,
           })
@@ -1275,7 +1356,7 @@ local function restoreCurrentConfig()
     local function runTask(i)
       if i > #tasks then arrangeFullscreenOrder(); return end
       local t = tasks[i]
-      local frame = frameInsideScreen(t.desc, t.uuid)
+      local frame = t.frame
       if t.kind == "fullscreen" then
         spaceMove.makeFullScreen(t.win, t.uuid, frame, function(method)
           if method ~= "none" then spacesTouched = true end
@@ -1287,6 +1368,11 @@ local function restoreCurrentConfig()
       elseif t.kind == "space" then
         spaceMove.moveWindowToSpace(t.win, t.sid, frame, obj.spaceSwitchHotkeys,
           function(method)
+            -- cascade では、置いたウィンドウを順に前面へ出し、右下のものほど手前にする。
+            -- 逆の重なり順だと、手前のウィンドウが奥のウィンドウのタイトルバーを隠す。
+            -- 非表示の Space にあるウィンドウに raise しても、Space は切り替わらず
+            -- 最前面のアプリも変わらない（実測）
+            if t.raise then pcall(function() t.win:raise() end) end
             -- Space を切り替える手段はどれも、最後に元の Space へ戻す必要がある
             if method == "drag" or method == "mc" or method == "failed" then
               spacesTouched = true
