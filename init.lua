@@ -1125,20 +1125,96 @@ local function restoreCurrentConfig()
   spaceMove.beginRestore()
   print("SpaceSaver: [" .. basename(path) .. "] を復元開始")
 
-  -- 復元中の表示。段階が進むたびに、1行目の下へ段階名と進捗を差し替えて出す。
-  -- フェードを切るのは、差し替えのたびに表示が点滅しないようにするため
-  local progressHeader = "SpaceSaver: [" .. basename(path) .. "] 復元中…操作しないでください（Esc で中断）"
+  -- 復元中の表示。1行目の下に全段階を並べ、段階ごとに状態と進捗を出す。
+  -- 列は空白ではなくタブ位置で揃える。文字幅がまちまちな表示用のフォントでは、
+  -- 空白の数で揃えても列がずれるため
+  local progressPhases = {
+    { key = "ops",     label = "Space の数を調整" },
+    { key = "rescan",  label = "Space を巡回してウィンドウを探索" },
+    { key = "place",   label = "ウィンドウを配置" },
+    { key = "arrange", label = "フルスクリーン Space を並べ替え" },
+  }
+  local PHASE_ICON = { pending = "⏳", running = "🔄", done = "✅" }
   local progressAlert
-  showProgress = function(label, done, total)
-    local text = progressHeader
-    if cancelRequested then
-      text = "SpaceSaver: [" .. basename(path) .. "] 中断しています…実行中の処理が終わるまでお待ちください"
-    elseif label and total > 0 then
-      text = string.format("%s\n%s %d/%d (%d%%)", text, label, done, total,
-        math.floor(done * 100 / total))
+
+  local function progressText()
+    local st = hs.alert.defaultStyle
+    local font = { name = st.textFont, size = st.textSize }
+    local function width(str)
+      return hs.drawing.getTextDrawingSize(hs.styledtext.new(str, { font = font })).w
+    end
+
+    -- 総数がまだ決まっていない段階は、件数の列に「–」だけを出す
+    local rows = {}
+    for _, ph in ipairs(progressPhases) do
+      local row = { icon = PHASE_ICON[ph.state or "pending"], label = ph.label }
+      if ph.total then
+        local pct = ph.total > 0 and math.floor(ph.done * 100 / ph.total) or 100
+        row.done, row.total, row.pct = ph.done .. "/", tostring(ph.total), "(" .. pct .. "%)"
+      else
+        row.done, row.total, row.pct = "–", "", ""
+      end
+      table.insert(rows, row)
+    end
+
+    -- 各列の幅。件数は3桁までを見込んで幅を取り、総数が決まっても列が動かないようにする
+    local gap = font.size * 0.5
+    local iconW, labelW = 0, 0
+    local doneW, totalW, pctW = width("000/"), width("000"), width("(100%)")
+    for _, r in ipairs(rows) do
+      iconW  = math.max(iconW,  width(r.icon))
+      labelW = math.max(labelW, width(r.label))
+      doneW  = math.max(doneW,  width(r.done))
+      totalW = math.max(totalW, width(r.total))
+      pctW   = math.max(pctW,   width(r.pct))
+    end
+    -- 処理済みの件数と「/」は右揃え、総数は左揃えにして「/」の位置を揃える。割合は右揃え
+    local labelAt = iconW + gap
+    local doneAt  = labelAt + labelW + gap * 2 + doneW
+    local totalAt = doneAt + 1
+    local pctAt   = totalAt + totalW + gap + pctW
+
+    local header = "SpaceSaver: [" .. basename(path) .. "] " .. (cancelRequested
+      and "中断しています…実行中の処理が終わるまでお待ちください"
+      or  "復元中…操作しないでください（Esc で中断）")
+    local lines = { header }
+    for _, r in ipairs(rows) do
+      table.insert(lines, table.concat({ r.icon, r.label, r.done, r.total, r.pct }, "\t"))
+    end
+    return hs.styledtext.new(table.concat(lines, "\n"), {
+      font = font,
+      color = st.textColor,
+      paragraphStyle = {
+        tabStops = {
+          { location = labelAt, tabStopType = "left" },
+          { location = doneAt,  tabStopType = "right" },
+          { location = totalAt, tabStopType = "left" },
+          { location = pctAt,   tabStopType = "right" },
+        },
+      },
+    })
+  end
+
+  -- key の段階を実行中にして、処理済みの件数と総数を更新する。key より前の段階は
+  -- 済んだものとして扱う。総数が決まらないまま済んだ段階（処理するものが無かった、
+  -- 設定で無効にしてある）は 0/0 とする。key を省くと、状態を変えずに表示だけ出し直す。
+  -- フェードを切るのは、出し直すたびに表示が点滅しないようにするため
+  showProgress = function(key, done, total)
+    if key then
+      local before = true
+      for _, ph in ipairs(progressPhases) do
+        if ph.key == key then
+          before = false
+          ph.done, ph.total = done, total
+          ph.state = (total and done >= total) and "done" or "running"
+        elseif before then
+          ph.total = ph.total or 0
+          ph.done, ph.state = ph.total, "done"
+        end
+      end
     end
     if progressAlert then hs.alert.closeSpecific(progressAlert, 0) end
-    progressAlert = showStatus(text, { fadeInDuration = 0, fadeOutDuration = 0 }, 999)
+    progressAlert = showStatus(progressText(), { fadeInDuration = 0, fadeOutDuration = 0 }, 999)
   end
   showProgress()
 
@@ -1219,6 +1295,14 @@ local function restoreCurrentConfig()
     cancelRestore = nil
     if escHotkey then escHotkey:delete(); escHotkey = nil end
     updateMenu()
+    -- 最後まで終えたときは、元の Space へ戻している間も全段階を済みとして見せる
+    if not cancelRequested then
+      for _, ph in ipairs(progressPhases) do
+        ph.total = ph.total or 0
+        ph.done, ph.state = ph.total, "done"
+      end
+      showProgress()
+    end
     if not spacesTouched then
       announceDone()
       return
@@ -1384,7 +1468,7 @@ local function restoreCurrentConfig()
 
       local function step(i)
         if i > #work or cancelRequested then finish(); return end
-        showProgress("フルスクリーン Space を並べ替え中", i - 1, #work)
+        showProgress("arrange", i - 1, #work)
         spaceOrder.arrange(work[i].uuid, work[i].targets, function(moved)
           if moved > 0 then
             spacesTouched = true
@@ -1400,7 +1484,7 @@ local function restoreCurrentConfig()
     -- ④ タスクを逐次・非同期で実行（ドラッグ方式に落ちる場合があるので1件ずつ待つ）
     local function runTask(i)
       if cancelRequested then finish(); return end
-      showProgress("ウィンドウを配置中", i - 1, #tasks)
+      showProgress("place", i - 1, #tasks)
       if i > #tasks then arrangeFullscreenOrder(); return end
       local t = tasks[i]
       local frame = t.frame
@@ -1510,7 +1594,7 @@ local function restoreCurrentConfig()
     local function step(i)
       if i > #worklist then onDone(pool); return end
       if cancelRequested then finish(); return end
-      showProgress("Space を巡回してウィンドウを探索中", i - 1, #worklist)
+      showProgress("rescan", i - 1, #worklist)
       local sid = worklist[i]
       pcall(hs.spaces.gotoSpace, sid)
       later(CAPTURE_SETTLE, function()
@@ -1571,7 +1655,7 @@ local function restoreCurrentConfig()
       later(RESTORE_DELAY, buildPoolAndPlace)
       return
     end
-    showProgress("Space の数を調整中", i - 1, #ops)
+    showProgress("ops", i - 1, #ops)
     local op = ops[i]
     if op.kind == "add" then
       pcall(hs.spaces.addSpaceToScreen, op.uuid, false)
