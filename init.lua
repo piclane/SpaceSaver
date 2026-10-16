@@ -235,8 +235,8 @@ end
 -- 処理中なのか終わったのかを見分けられない。そのため、全 Space と全画面表示のアプリの Space に
 -- 現れるように、表示に使うウィンドウの behavior を変更する。
 -- Mission Control を開いている間は、変更前と同じくメッセージは隠れる。
-local function showStatus(message, duration)
-  local id = hs.alert.show(message, duration)
+local function showStatus(message, ...)
+  local id = hs.alert.show(message, ...)
   -- hs.alert は表示に使う hs.drawing を返さないので、モジュール内部の一覧から UUID で探す。
   -- 一覧の形が変わって見つからない場合も、メッセージ自体は表示される
   pcall(function()
@@ -1102,7 +1102,21 @@ local function restoreCurrentConfig()
   -- 持ち越すと、次の復元でも同じ手段を試さないまま失敗し続ける
   spaceMove.beginRestore()
   print("SpaceSaver: [" .. basename(path) .. "] を復元開始")
-  showStatus("SpaceSaver: [" .. basename(path) .. "] 復元中…操作しないでください", 999)
+
+  -- 復元中の表示。段階が進むたびに、1行目の下へ段階名と進捗を差し替えて出す。
+  -- フェードを切るのは、差し替えのたびに表示が点滅しないようにするため
+  local progressHeader = "SpaceSaver: [" .. basename(path) .. "] 復元中…操作しないでください"
+  local progressAlert
+  local function showProgress(label, done, total)
+    local text = progressHeader
+    if label and total > 0 then
+      text = string.format("%s\n%s %d/%d (%d%%)", text, label, done, total,
+        math.floor(done * 100 / total))
+    end
+    if progressAlert then hs.alert.closeSpecific(progressAlert, 0) end
+    progressAlert = showStatus(text, { fadeInDuration = 0, fadeOutDuration = 0 }, 999)
+  end
+  showProgress()
 
   -- 巡回後に戻すため、現在のアクティブ Space を記録（capture と同じ）
   local originalActive = {}
@@ -1340,6 +1354,7 @@ local function restoreCurrentConfig()
 
       local function step(i)
         if i > #work then finish(); return end
+        showProgress("フルスクリーン Space を並べ替え中", i - 1, #work)
         spaceOrder.arrange(work[i].uuid, work[i].targets, function(moved)
           if moved > 0 then
             spacesTouched = true
@@ -1354,6 +1369,7 @@ local function restoreCurrentConfig()
 
     -- ④ タスクを逐次・非同期で実行（ドラッグ方式に落ちる場合があるので1件ずつ待つ）
     local function runTask(i)
+      showProgress("ウィンドウを配置中", i - 1, #tasks)
       if i > #tasks then arrangeFullscreenOrder(); return end
       local t = tasks[i]
       local frame = t.frame
@@ -1462,6 +1478,7 @@ local function restoreCurrentConfig()
     spacesTouched = true
     local function step(i)
       if i > #worklist then onDone(pool); return end
+      showProgress("Space を巡回してウィンドウを探索中", i - 1, #worklist)
       local sid = worklist[i]
       pcall(hs.spaces.gotoSpace, sid)
       later(CAPTURE_SETTLE, function()
@@ -1521,6 +1538,7 @@ local function restoreCurrentConfig()
       later(RESTORE_DELAY, buildPoolAndPlace)
       return
     end
+    showProgress("Space の数を調整中", i - 1, #ops)
     local op = ops[i]
     if op.kind == "add" then
       pcall(hs.spaces.addSpaceToScreen, op.uuid, false)
