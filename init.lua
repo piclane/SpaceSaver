@@ -42,6 +42,8 @@
   復元（自動）:
     - モニタ構成変更時（dock脱着など）に自動実行
     - メニューバーの 再リストア で手動実行も可
+    - 復元中は Esc かメニューバーの 復元を中断 で中断できる。
+      実行中のウィンドウ移動を終えてから止め、元の Space に戻す
 
   前提条件:
     - システム設定 > デスクトップとDock >
@@ -185,6 +187,7 @@ local screenWatcher    = nil
 local screenTimer      = nil
 local menubar          = nil
 local windowFilter     = nil   -- 非可視Spaceも含むウィンドウ列挙用（遅延生成）
+local cancelRestore    = nil   -- 復元中だけ設定される、復元を中断する関数
 
 -- 一度でも評価したウィンドウの ID（プールに入れたものも、標準ウィンドウでないと
 -- 弾いたものも含む）。どの Space を表示して拾い直すかの判断に使う。
@@ -1097,6 +1100,25 @@ local function restoreCurrentConfig()
   end
 
   busy = true
+
+  -- 中断の要求は、各段階の1件ごとの区切りで確かめる。実行中のウィンドウ移動は
+  -- 途中で止めない。ドラッグ方式はマウスボタンを押したままにするので、途中で
+  -- 止めるとボタンが押されたまま残る
+  local cancelRequested = false
+  local escHotkey
+  local showProgress
+  cancelRestore = function()
+    if cancelRequested then return end
+    cancelRequested = true
+    print("SpaceSaver: 復元の中断を受け付けました")
+    showProgress()
+  end
+  -- Esc は復元中だけ割り当てる。割り当てている間、Esc は他のアプリに届かない
+  escHotkey = hs.hotkey.bind({}, "escape", function()
+    if cancelRestore then cancelRestore() end
+  end)
+  updateMenu()
+
   -- アプリごとに積み上げた「この手段は効かない」の記録を捨ててから始める。
   -- 効かないという判断は、Mission Control の反応が遅いといった一時的な事情でも下る。
   -- 持ち越すと、次の復元でも同じ手段を試さないまま失敗し続ける
@@ -1105,11 +1127,13 @@ local function restoreCurrentConfig()
 
   -- 復元中の表示。段階が進むたびに、1行目の下へ段階名と進捗を差し替えて出す。
   -- フェードを切るのは、差し替えのたびに表示が点滅しないようにするため
-  local progressHeader = "SpaceSaver: [" .. basename(path) .. "] 復元中…操作しないでください"
+  local progressHeader = "SpaceSaver: [" .. basename(path) .. "] 復元中…操作しないでください（Esc で中断）"
   local progressAlert
-  local function showProgress(label, done, total)
+  showProgress = function(label, done, total)
     local text = progressHeader
-    if label and total > 0 then
+    if cancelRequested then
+      text = "SpaceSaver: [" .. basename(path) .. "] 中断しています…実行中の処理が終わるまでお待ちください"
+    elseif label and total > 0 then
       text = string.format("%s\n%s %d/%d (%d%%)", text, label, done, total,
         math.floor(done * 100 / total))
     end
@@ -1183,12 +1207,18 @@ local function restoreCurrentConfig()
 
   local function announceDone()
     busy = false
+    local result = cancelRequested and "復元を中断しました" or "復元完了"
     hs.alert.closeAll()
-    showStatus("SpaceSaver: [" .. basename(path) .. "] 復元完了")
-    print("SpaceSaver: [" .. basename(path) .. "] 復元完了")
+    showStatus("SpaceSaver: [" .. basename(path) .. "] " .. result)
+    print("SpaceSaver: [" .. basename(path) .. "] " .. result)
   end
 
   local function finish()
+    -- 後始末に入ったら、もう中断は受け付けない。ここで中断を受け付けると、
+    -- 最後まで終えた復元を「中断しました」と知らせてしまう
+    cancelRestore = nil
+    if escHotkey then escHotkey:delete(); escHotkey = nil end
+    updateMenu()
     if not spacesTouched then
       announceDone()
       return
@@ -1353,7 +1383,7 @@ local function restoreCurrentConfig()
       end
 
       local function step(i)
-        if i > #work then finish(); return end
+        if i > #work or cancelRequested then finish(); return end
         showProgress("フルスクリーン Space を並べ替え中", i - 1, #work)
         spaceOrder.arrange(work[i].uuid, work[i].targets, function(moved)
           if moved > 0 then
@@ -1369,6 +1399,7 @@ local function restoreCurrentConfig()
 
     -- ④ タスクを逐次・非同期で実行（ドラッグ方式に落ちる場合があるので1件ずつ待つ）
     local function runTask(i)
+      if cancelRequested then finish(); return end
       showProgress("ウィンドウを配置中", i - 1, #tasks)
       if i > #tasks then arrangeFullscreenOrder(); return end
       local t = tasks[i]
@@ -1478,6 +1509,7 @@ local function restoreCurrentConfig()
     spacesTouched = true
     local function step(i)
       if i > #worklist then onDone(pool); return end
+      if cancelRequested then finish(); return end
       showProgress("Space を巡回してウィンドウを探索中", i - 1, #worklist)
       local sid = worklist[i]
       pcall(hs.spaces.gotoSpace, sid)
@@ -1533,6 +1565,7 @@ local function restoreCurrentConfig()
 
   -- 操作キューを1つずつ非同期で実行（Mission Control の競合を避けるため逐次・遅延つき）
   local function runOps(i)
+    if cancelRequested then finish(); return end
     if i > #ops then
       pcall(hs.spaces.closeMissionControl)
       later(RESTORE_DELAY, buildPoolAndPlace)
@@ -1593,7 +1626,9 @@ updateMenu = function()
       end,
     },
     { title = "-" },
-    { title = "再リストア", fn = function() restoreCurrentConfig() end },
+    cancelRestore
+      and { title = "復元を中断", fn = function() if cancelRestore then cancelRestore() end end }
+      or  { title = "再リストア", fn = function() restoreCurrentConfig() end },
     {
       title = "設定ファイルを開く",
       fn = function()
