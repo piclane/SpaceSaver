@@ -101,7 +101,7 @@
         },
         "windows": {
           "type": "array",
-          "description": "このSpaceに配置するウィンドウのリスト。リストア時に bundleID + title/titlePattern で照合し、一致したウィンドウを全て配置する（1記述=nウィンドウ）。bundleIDだけの一致は使わない。",
+          "description": "このSpaceに配置するウィンドウのリスト。リストア時に bundleID + finderTab/title/titlePattern で照合し、一致したウィンドウを全て配置する（1記述=nウィンドウ）。bundleIDだけの一致は使わない。",
           "items": { "$ref": "#/$defs/window" }
         }
       }
@@ -122,6 +122,10 @@
         "titlePattern": {
           "type": "string",
           "description": "ウィンドウタイトルのLuaパターン (例: '^MyApp - ')。可変タイトルのアプリに手動で追記する。titleより優先される。パターンに一致するウィンドウが全て対象になる。Luaパターン記法（PCREとは一部異なる）。"
+        },
+        "finderTab": {
+          "type": "string",
+          "description": "Finder のウィンドウを、タブが表示しているフォルダのパスで指定する (例: '~/Documents/Projects')。bundleID は com.apple.finder にする。このフォルダを表示しているタブを含むウィンドウが対象で、選択されていないタブでもよい。手動で追記する。title/titlePattern より優先され、書くと title/titlePattern は照合に使わない。照合はファイルの実体（inode）で行うので、濁点の表記ゆれやシンボリックリンクがあっても一致する。先頭の ~ はホームディレクトリに展開する。Hammerspoon に Finder を操作する許可が必要。"
         },
         "frame": {
           "$ref": "#/$defs/frame",

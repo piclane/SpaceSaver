@@ -53,6 +53,9 @@
       Mission Control 経由の移動で、ウィンドウのサムネイルをウィンドウサーバーの
       タイトルで照合するのに使う。許可が無いと、Chrome のようにアクセシビリティ用の
       タイトルが画面に出るタイトルと違うアプリは、Mission Control 経由で移せない
+    - （finderTab を使う場合）Hammerspoonに Finder を操作する許可（オートメーション）を
+      与えておくこと。タブが表示しているフォルダを AppleScript で取得するのに使う。
+      finderTab を書いていないレイアウトでは Finder に問い合わせない
     - yq (https://github.com/mikefarah/yq) v4 が
       /opt/homebrew/bin/yq または PATH に存在すること
     - （推奨）「視差効果を減らす」を有効にするとキャプチャ中の画面切替が目立たなくなる
@@ -76,6 +79,9 @@
       一致しなかった既存エントリは元の位置に残る（ignoreに一致するものは削除）
     - cascade: true の記述は、一致したウィンドウを frame の位置から右下へずらして並べる。
       再キャプチャではこの記述を書き換えず、一致したウィンドウも個別には記録しない
+    - finderTab の記述は、そのフォルダを表示しているタブを含む Finder のウィンドウに一致する。
+      選択されていないタブの所属は表示名で決めるので、同じ表示名のタブが複数のウィンドウに
+      あって表示しているフォルダが違うと、そのタブでは一致しない
     - 選択されていないタブ（Finder や Terminal のタブ）は、どの Space にも属さないので
       配置の対象にしない
     - yq不在時はJSONフォールバック（space_layouts_<n>.json / space_common.json）で動作
@@ -554,6 +560,156 @@ local function screenMetadata(uuid, prev)
 end
 
 -- ============================================================
+-- Finder のタブ
+-- ============================================================
+
+local FINDER_BUNDLE_ID = "com.apple.finder"
+
+-- path が指すファイルの識別子（"デバイス番号:inode 番号" の文字列）を返す。
+-- path の先頭の ~ はホームディレクトリに展開し、シンボリックリンクはリンク先をたどる。
+-- ファイルが無いときと、path が文字列でないか空文字のときは nil を返す。
+-- パスを文字列のまま比べないのは、Finder が返すパスでは濁点・半濁点が結合文字に
+-- 分かれていることがあり（NFD）、YAML に書いたパスとバイト列が一致しないため。
+-- たとえば「ピ」が「ヒ」と U+309A の 2 文字で返る（Dropbox 配下のフォルダで確認）
+local function fileIdentity(path)
+  if type(path) ~= "string" or path == "" then return nil end
+  if path == "~" or path:sub(1, 2) == "~/" then
+    path = (os.getenv("HOME") or "") .. path:sub(2)
+  end
+  local attrs = hs.fs.attributes(path)
+  if not attrs then return nil end
+  return tostring(attrs.dev) .. ":" .. tostring(attrs.ino)
+end
+
+-- file URL をパスに変換して返す。file URL でなければ nil を返す
+local function pathFromFileURL(url)
+  if type(url) ~= "string" then return nil end
+  local path = url:match("^file://[^/]*(/.*)$")
+  if not path then return nil end
+  return (path:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
+end
+
+-- Finder のタブ 1 枚ごとの表示名と、表示しているフォルダの識別子（fileIdentity の値）を
+-- 取得して返す。戻り値は次の 2 つのテーブルを持つ。
+--   byID          全てのタブ。ウィンドウ ID -> { name = 表示名, key = 識別子 }
+--   hiddenByName  選択されていないタブだけ。表示名 -> { name, key } の配列
+-- key は、タブがフォルダ以外（コンピュータ、「最近の項目」など）を表示していれば nil になる。
+-- Finder が起動していないときと、AppleScript が失敗したときは、どちらも空のテーブルを返す。
+-- AppleScript が失敗したときは、そのエラーをコンソールに出力する。
+--
+-- Finder のタブは 1 枚ずつが別のウィンドウで、AppleScript の Finder window の id は
+-- hs.window:id() と同じ番号になる。選択中のタブはタブバーを持つウィンドウとして見え、
+-- 選択されていないタブはどの Space にも属さない（hs.spaces.windowSpaces が空を返す）。
+-- 選択されていないタブがどのウィンドウに属するかは AppleScript からは分からないので、
+-- 表示名から探せるようにしておく（finderTabFolders で使う）。
+-- AppleScript の呼び出しは 1 回 100 ms ほどかかり、その間 Hammerspoon は止まるので、
+-- 復元やキャプチャの開始時に 1 回だけ呼ぶ。タブごとに問い合わせる形にすると、
+-- タブ 11 枚で 600 ms ほどかかった
+local function readFinderTabs()
+  local tabs = { byID = {}, hiddenByName = {} }
+  if not hs.application.get(FINDER_BUNDLE_ID) then return tabs end
+  local ok, res, raw = hs.osascript.applescript([[
+tell application "Finder"
+  set ids to id of every Finder window
+  set nms to name of every Finder window
+  set urls to URL of target of every Finder window
+  return {ids, nms, urls}
+end tell]])
+  if not ok or type(res) ~= "table" then
+    print("SpaceSaver: Finder のタブを取得できません " .. (hs.inspect(raw):gsub("%s+", " ")))
+    return tabs
+  end
+  local ids, names, urls = res[1] or {}, res[2] or {}, res[3] or {}
+  for i, id in ipairs(ids) do
+    local tab = { name = names[i] or "", key = fileIdentity(pathFromFileURL(urls[i])) }
+    tabs.byID[id] = tab
+    local sok, spaces = pcall(hs.spaces.windowSpaces, id)
+    if sok and type(spaces) == "table" and #spaces == 0 then
+      local list = tabs.hiddenByName[tab.name] or {}
+      table.insert(list, tab)
+      tabs.hiddenByName[tab.name] = list
+    end
+  end
+  return tabs
+end
+
+-- Finder のウィンドウ win が含むタブのうち、フォルダを表示しているタブの識別子
+-- （fileIdentity の値）を集合 { [識別子] = true } で返す。tabs は readFinderTabs の戻り値。
+-- 選択されていないタブのうち、同じ名前のタブが他のウィンドウにもあって所属を決められなかった
+-- 表示名は、集合に含めずにコンソールへ出力する。
+-- win から AX を読めないときは、選択中のタブの分だけを返す。
+--
+-- 選択中のタブは、win のウィンドウ ID で tabs.byID から取得する。
+-- 選択されていないタブは、タブバー（ウィンドウ直下の AXTabGroup）に並ぶ表示名を
+-- tabs.hiddenByName と照合する。表示名 N のタブは、次の順に扱いを決める。
+-- 枚数は、このウィンドウの選択されていないタブのうち N という名前のものを数える。
+--   1. N の隠れたタブの数が、このウィンドウにある N のタブの数と同じなら、全てこのウィンドウのもの
+--   2. そうでなくても、N の隠れたタブが全て同じフォルダを表示していれば、そのフォルダを含める
+--   3. どちらでもなければ、別のウィンドウにある同じ名前のタブと区別できないので含めない
+-- タブを AX で押して選択し直せば所属は確実に分かるが、選択中のタブが変わってしまうので行わない
+local function finderTabFolders(win, tabs)
+  local folders = {}
+  local okID, wid = pcall(function() return win:id() end)
+  local selected = okID and wid and tabs.byID[wid]
+  if selected and selected.key then folders[selected.key] = true end
+
+  -- 選択されていないタブの枚数を表示名ごとに数える
+  local counts = {}
+  pcall(function()
+    local ax = hs.axuielement.windowElement(win)
+    for _, child in ipairs(ax and ax:attributeValue("AXChildren") or {}) do
+      if child:attributeValue("AXRole") == "AXTabGroup" then
+        for _, tab in ipairs(child:attributeValue("AXChildren") or {}) do
+          if tab:attributeValue("AXRole") == "AXRadioButton"
+             and tab:attributeValue("AXValue") ~= true then
+            local name = tab:attributeValue("AXTitle") or ""
+            counts[name] = (counts[name] or 0) + 1
+          end
+        end
+      end
+    end
+  end)
+
+  for name, count in pairs(counts) do
+    local hidden = tabs.hiddenByName[name] or {}
+    -- フォルダを表示している隠れたタブの識別子と、その種類の数
+    local keys, kinds = {}, 0
+    local hasNonFolder = false
+    for _, tab in ipairs(hidden) do
+      if not tab.key then
+        hasNonFolder = true
+      elseif not keys[tab.key] then
+        keys[tab.key] = true
+        kinds = kinds + 1
+      end
+    end
+    if #hidden == count or (kinds == 1 and not hasNonFolder) then
+      for key in pairs(keys) do folders[key] = true end
+    elseif kinds > 0 then
+      print(string.format(
+        "SpaceSaver: Finder のタブ [%s] が表示しているフォルダを特定できません"
+        .. "（同じ名前のタブが他のウィンドウにもあります）", name))
+    end
+  end
+  return folders
+end
+
+-- レイアウト data に finderTab を書いた記述があるかを返す。
+-- 無ければ Finder への問い合わせ（readFinderTabs）を省く。問い合わせの間 Hammerspoon が
+-- 止まるのを避けるのと、Finder を操作する許可を求めるダイアログを不要な場面で出さないため
+local function usesFinderTab(data)
+  if not data or type(data.screens) ~= "table" then return false end
+  for _, screenData in pairs(data.screens) do
+    for _, sp in ipairs(screenData.spaces or {}) do
+      for _, desc in ipairs(sp.windows or {}) do
+        if desc.finderTab then return true end
+      end
+    end
+  end
+  return false
+end
+
+-- ============================================================
 -- ウィンドウ記述 / 照合
 -- ============================================================
 
@@ -580,6 +736,22 @@ local function titleMatches(desc, actualTitle)
     return string.find(actualTitle, desc.titlePattern) ~= nil
   end
   return actualTitle == (desc.title or "")
+end
+
+-- レイアウトの記述 desc が実ウィンドウに一致するかを返す。
+-- actual は windowDescriptor の戻り値、folders は finderTabFolders の戻り値
+-- （Finder 以外のウィンドウと、Finder のタブを取得しなかったときは nil）。
+-- bundleID が一致したうえで、desc に finderTab があれば、そのフォルダを表示している
+-- タブをウィンドウが含むときに一致する。finderTab が無ければ title/titlePattern で照合する。
+-- finderTab があると title/titlePattern は見ない。キャプチャが記録した title が残っていても、
+-- 選択中のタブが変わればウィンドウのタイトルも変わるので、両方を条件にすると一致しなくなるため
+local function descMatches(desc, actual, folders)
+  if desc.bundleID ~= actual.bundleID then return false end
+  if desc.finderTab then
+    local key = fileIdentity(desc.finderTab)
+    return key ~= nil and folders ~= nil and folders[key] == true
+  end
+  return titleMatches(desc, actual.title)
 end
 
 -- titlePattern の「自由度の低さ」を数える。
@@ -621,14 +793,17 @@ local function patternSpecificity(pat)
 end
 
 -- 記述の絞り込みの強さ。大きいほど自由度が低い。
--- ウィンドウの行き先を決める主基準。title の完全一致はどのパターンより強い
+-- ウィンドウの行き先を決める主基準。finderTab はフォルダを名指しするので最も強く、
+-- title の完全一致はどのパターンより強い
 local function descSpecificity(desc)
+  if desc.finderTab then return math.huge end
   if desc.titlePattern then return patternSpecificity(desc.titlePattern) end
   return 1000 + #(desc.title or "")
 end
 
 -- レイアウトのスロットにウィンドウを割り当てる。結果は slot.entries（配列）に入れる。
--- 1つの記述は、bundleID と title/titlePattern が一致するウィンドウを全て取る。
+-- 1つの記述は、descMatches で一致するウィンドウ（bundleID が同じで、finderTab か
+-- title/titlePattern が一致するもの）を全て取る。
 -- title の完全一致でも同じタイトルのウィンドウは複数ありうるし、
 -- '.*' のようなパターンなら当然複数当たるので、記述とウィンドウは 1 対 n で対応する。
 -- bundleID だけの一致は使わない。使うと、パターンを書き損じたウィンドウが
@@ -648,8 +823,7 @@ local function assignWindows(slots, pool)
     local best, bestSpec
     for _, slot in ipairs(slots) do
       if not slot.noSpace
-         and slot.desc.bundleID == entry.desc.bundleID
-         and titleMatches(slot.desc, entry.desc.title) then
+         and descMatches(slot.desc, entry.desc, entry.finderFolders) then
         local spec = descSpecificity(slot.desc)
         if not best or spec > bestSpec
            or (spec == bestSpec and #slot.entries < #best.entries) then
@@ -661,10 +835,17 @@ local function assignWindows(slots, pool)
   end
 end
 
--- desc のタイトル指定 (pattern または title) と bundleID を "[key]=[val] bundleID=[...]" で返す
+-- desc の照合条件 (finderTab、pattern、title のいずれか) と bundleID を
+-- "[key]=[val] bundleID=[...]" で返す
 local function descKeyLabel(desc)
-  local key = desc.titlePattern and "pattern" or "title"
-  local val = desc.titlePattern or desc.title or ""
+  local key, val
+  if desc.finderTab then
+    key, val = "finderTab", desc.finderTab
+  elseif desc.titlePattern then
+    key, val = "pattern", desc.titlePattern
+  else
+    key, val = "title", desc.title or ""
+  end
   return string.format("%s=[%s] bundleID=[%s]", key, val, desc.bundleID or "")
 end
 
@@ -763,23 +944,29 @@ local function collectExistingEntries(data)
 end
 
 -- 実ウィンドウ actual に一致する既存エントリの添字を返す（無ければ nil）。
+-- folders は finderTabFolders の戻り値（Finder 以外のウィンドウでは nil）。
+-- finderTab のエントリに一致すれば、それを返す。それ以外は最初に一致したエントリを返す。
+-- finderTab を優先するのは、同じウィンドウを title で記録したエントリが前に残っていると、
+-- そちらがウィンドウを取り、手で書いた finderTab のエントリの frame が更新されなくなるため。
 -- 復元と同じく bundleID だけのフォールバックは使わない。
 -- 使うと titlePattern が無関係なウィンドウに吸い付き、誤った紐づけのまま保存されてしまう
-local function findExistingEntry(actual, entries)
+local function findExistingEntry(actual, entries, folders)
+  local first = nil
   for i, e in ipairs(entries) do
-    if e.desc.bundleID == actual.bundleID and titleMatches(e.desc, actual.title) then
-      return i
+    if descMatches(e.desc, actual, folders) then
+      if e.desc.finderTab then return i end
+      first = first or i
     end
   end
-  return nil
+  return first
 end
 
 -- 実ウィンドウ actual に一致する既存エントリを取り出す。
 -- 復元は 1 つの記述に一致する全ウィンドウを配置するが、こちらは実ウィンドウ 1 枚ごとに
 -- エントリを 1 つ消費する。同じ記述を複数のウィンドウで共有すると、
 -- どのウィンドウの frame を書き戻すのか決められない
-local function takeExistingEntry(actual, entries)
-  local i = findExistingEntry(actual, entries)
+local function takeExistingEntry(actual, entries, folders)
+  local i = findExistingEntry(actual, entries, folders)
   return i and table.remove(entries, i) or nil
 end
 
@@ -807,8 +994,9 @@ local function ensureWindowFilter()
   return windowFilter
 end
 
--- win から { win=..., desc=... } のプールエントリを作る（対象外なら nil）
-local function poolEntry(win, ignoreRules)
+-- win から { win=..., desc=..., finderFolders=... } のプールエントリを作る（対象外なら nil）。
+-- finderTabs は readFinderTabs の戻り値。nil なら finderFolders を求めない
+local function poolEntry(win, ignoreRules, finderTabs)
   -- 弾いた場合も評価済みとして覚える。覚えないと、通知センターのような
   -- 標準でないウィンドウが居座る Space を毎回表示しに行くことになる
   local wid = nil
@@ -841,7 +1029,11 @@ local function poolEntry(win, ignoreRules)
   -- 別のエントリに割り当てられ、意図しない位置へ動かされる
   if isIgnored(ignoreRules, desc.bundleID, desc.title) then return nil end
 
-  return { win = win, desc = desc }
+  local folders = nil
+  if finderTabs and desc.bundleID == FINDER_BUNDLE_ID then
+    folders = finderTabFolders(win, finderTabs)
+  end
+  return { win = win, desc = desc, finderFolders = folders }
 end
 
 -- その Space に、まだ評価していないウィンドウがあるか。
@@ -858,11 +1050,11 @@ local function hasUnevaluatedWindow(sid)
   return false
 end
 
--- Space を切り替えずにウィンドウプールを構築する
-local function buildPool(ignoreRules)
+-- Space を切り替えずにウィンドウプールを構築する。finderTabs は poolEntry と同じ
+local function buildPool(ignoreRules, finderTabs)
   local pool = {}
   for _, win in ipairs(ensureWindowFilter():getWindows()) do
-    local entry = poolEntry(win, ignoreRules)
+    local entry = poolEntry(win, ignoreRules, finderTabs)
     if entry then table.insert(pool, entry) end
   end
   return pool
@@ -953,6 +1145,8 @@ function obj:capture()
   local ignoreRules = (existingData and existingData.ignoreEffective)
                       or effectiveIgnore(nil)
   local leftover    = collectExistingEntries(existingData)
+  -- 既存の finderTab のエントリと照合するときだけ、Finder のタブを取得する
+  local finderTabs  = usesFinderTab(existingData) and readFinderTabs() or nil
 
   -- cascade の記述は leftover から分け、書き換えずに元の位置へ戻す。
   -- frame はずらし始める起点として手書きした値で、実ウィンドウはそこからずれた位置にあるので、
@@ -1063,13 +1257,17 @@ function obj:capture()
             if isStd then
               local desc = windowDescriptor(win)
               if desc and not isIgnored(ignoreRules, desc.bundleID, desc.title) then
+                local folders = nil
+                if finderTabs and desc.bundleID == FINDER_BUNDLE_ID then
+                  folders = finderTabFolders(win, finderTabs)
+                end
                 -- 既存エントリに一致するなら、それを再利用して frame だけ実測値に更新する。
                 -- 手書きした titlePattern や note を再キャプチャで失わないため。
-                local prev = takeExistingEntry(desc, leftover)
+                local prev = takeExistingEntry(desc, leftover, folders)
                 if prev then
                   prev.desc.frame = desc.frame
                   table.insert(windows, prev.desc)
-                elseif isFS or not findExistingEntry(desc, cascades) then
+                elseif isFS or not findExistingEntry(desc, cascades, folders) then
                   -- cascade の記述に一致するウィンドウは、その記述に含まれるので記録しない。
                   -- ただしフルスクリーンのウィンドウは記録する。記録しないと、次の復元で
                   -- cascade の記述の Space へ移され、フルスクリーンで復元されなくなる
@@ -1532,6 +1730,10 @@ local function restoreCurrentConfig()
     runTask(1)
   end
 
+  -- Finder のタブ（readFinderTabs の戻り値）。buildPoolAndPlace で取得し、
+  -- rescanSpaces が拾い直したウィンドウの照合にも使う。finderTab の記述が無ければ nil のまま
+  local finderTabs = nil
+
   -- まだ評価していないウィンドウを、Space を表示して拾う。
   -- macOS は非可視 Space のウィンドウを AX に出さないため、その Space を表示するまで
   -- hs.window.get は nil を返す。表示する以外に取得する手段がない。
@@ -1617,7 +1819,7 @@ local function restoreCurrentConfig()
             if not seen[wid] then
               seen[wid] = true
               local win = hs.window.get(wid)
-              local entry = win and poolEntry(win, data.ignoreEffective)
+              local entry = win and poolEntry(win, data.ignoreEffective, finderTabs)
               if entry then table.insert(pool, entry) end
             end
           end
@@ -1633,7 +1835,8 @@ local function restoreCurrentConfig()
   -- アプリが起動中なのに照合できなかった記述は、ウィンドウ列挙の取りこぼしか
   -- レイアウトの記述ずれのどちらかなので、判断材料としてログに出す。
   local function buildPoolAndPlace()
-    local pool  = buildPool(data.ignoreEffective)
+    finderTabs  = usesFinderTab(data) and readFinderTabs() or nil
+    local pool  = buildPool(data.ignoreEffective, finderTabs)
     local unmet = missingButRunning(unmatchedDescriptors(pool, data))
 
     if #unmet > 0 then
