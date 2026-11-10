@@ -76,6 +76,8 @@
       一致しなかった既存エントリは元の位置に残る（ignoreに一致するものは削除）
     - cascade: true の記述は、一致したウィンドウを frame の位置から右下へずらして並べる。
       再キャプチャではこの記述を書き換えず、一致したウィンドウも個別には記録しない
+    - 選択されていないタブ（Finder や Terminal のタブ）は、どの Space にも属さないので
+      配置の対象にしない
     - yq不在時はJSONフォールバック（space_layouts_<n>.json / space_common.json）で動作
     - 共通ファイルの ignore は照合にだけ使い、レイアウトファイルには書き戻さない。
       書き戻すと共通の規則が全レイアウトファイルに複製される
@@ -823,6 +825,14 @@ local function poolEntry(win, ignoreRules)
   local isStd = false
   pcall(function() isStd = win:isStandard() end)
   if not isStd then return nil end
+
+  -- 選択されていないタブを除く。Finder や Terminal のタブは 1 枚ずつが別のウィンドウで、
+  -- 選択されていないタブはどの Space にも属さない（hs.spaces.windowSpaces が空を返す）。
+  -- hs.window.filter は一度選択されたタブを選択が外れたあとも保持しているので、
+  -- 除かないと記述に一致して移動の対象になる。
+  -- 最小化したウィンドウと、隠したアプリのウィンドウは Space に属したままなので除かれない
+  local okSpaces, spaces = pcall(hs.spaces.windowSpaces, win)
+  if okSpaces and type(spaces) == "table" and #spaces == 0 then return nil end
 
   local desc = windowDescriptor(win)
   if not desc then return nil end
