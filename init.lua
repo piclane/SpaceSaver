@@ -27,8 +27,9 @@
 
   （任意）ホットキー:
          spoon.SpaceSaver:bindHotkeys({
-           capture = {{"cmd","alt","ctrl"}, "c"},
-           restore = {{"cmd","alt","ctrl"}, "r"},
+           capture   = {{"cmd","alt","ctrl"}, "c"},
+           restore   = {{"cmd","alt","ctrl"}, "r"},
+           addWindow = {{"cmd","alt","ctrl"}, "a"},
          })
 
   （任意）データ保存先の変更（:start() の前に設定すること）:
@@ -38,6 +39,13 @@
     - メニューバーの ⊞ > レイアウトをキャプチャ
     - open -g "hammerspoon://space-capture"
     - ~/.hammerspoon/Spoons/SpaceSaver.spoon/capture-layout.sh
+
+  アクティブなウィンドウだけを追加（手動）:
+    - メニューバーの ⊞ > アクティブなウィンドウを追加
+    - open -g "hammerspoon://space-add-window"
+    - 現在の構成のファイルに、ウィンドウが今いる Space の記述として書く。
+      Finder は選択中のタブのフォルダを finderTab に、それ以外は title に書く。
+      同じ記述が既にあれば、それを今の Space へ移して frame を更新する
 
   復元（自動）:
     - モニタ構成変更時（dock脱着など）に自動実行
@@ -591,9 +599,10 @@ end
 
 -- Finder のタブ 1 枚ごとの表示名と、表示しているフォルダの識別子（fileIdentity の値）を
 -- 取得して返す。戻り値は次の 2 つのテーブルを持つ。
---   byID          全てのタブ。ウィンドウ ID -> { name = 表示名, key = 識別子 }
---   hiddenByName  選択されていないタブだけ。表示名 -> { name, key } の配列
--- key は、タブがフォルダ以外（コンピュータ、「最近の項目」など）を表示していれば nil になる。
+--   byID          全てのタブ。ウィンドウ ID -> { name = 表示名, key = 識別子, path = パス }
+--   hiddenByName  選択されていないタブだけ。表示名 -> { name, key, path } の配列
+-- key と path は、タブがフォルダ以外（コンピュータ、「最近の項目」など）を表示していれば
+-- nil になる。path は Finder が返したままの形で、末尾に / が付く。
 -- Finder が起動していないときと、AppleScript が失敗したときは、どちらも空のテーブルを返す。
 -- AppleScript が失敗したときは、そのエラーをコンソールに出力する。
 --
@@ -621,7 +630,8 @@ end tell]])
   end
   local ids, names, urls = res[1] or {}, res[2] or {}, res[3] or {}
   for i, id in ipairs(ids) do
-    local tab = { name = names[i] or "", key = fileIdentity(pathFromFileURL(urls[i])) }
+    local path = pathFromFileURL(urls[i])
+    local tab = { name = names[i] or "", key = fileIdentity(path), path = path }
     tabs.byID[id] = tab
     local sok, spaces = pcall(hs.spaces.windowSpaces, id)
     if sok and type(spaces) == "table" and #spaces == 0 then
@@ -1291,6 +1301,239 @@ function obj:capture()
 end
 
 -- ============================================================
+-- アクティブなウィンドウの追加（手動）
+-- ============================================================
+
+-- テーブル value を、入れ子のテーブルまで複製して返す。テーブル以外はそのまま返す。
+-- 読み込んだレイアウトを書き換える前に使う。hs.json.decode は内容が同じテーブル
+-- （空の配列や、記述の無い同じ形の Space）を全て同じテーブルで返すので、
+-- そのまま書き換えると、同じテーブルを参照する全ての箇所が変わってしまう
+local function deepCopy(value)
+  if type(value) ~= "table" then return value end
+  local copy = {}
+  for k, v in pairs(value) do copy[k] = deepCopy(v) end
+  return copy
+end
+
+-- パスを YAML に書く形にして返す。末尾の / を除き、ホームディレクトリの部分を ~ にする
+local function layoutPath(path)
+  if #path > 1 then path = (path:gsub("/+$", "")) end
+  local home = os.getenv("HOME")
+  if home and home ~= "" then
+    if path == home then return "~" end
+    if path:sub(1, #home + 1) == home .. "/" then return "~" .. path:sub(#home + 1) end
+  end
+  return path
+end
+
+-- ウィンドウ win をレイアウトの記述 { bundleID, frame, finderTab か title } にして返す。
+-- ウィンドウの情報を取得できなければ nil を返す。
+-- Finder のウィンドウは、選択中のタブが表示しているフォルダを finderTab に書く。
+-- そのフォルダは readFinderTabs で Finder に問い合わせて取得する（100 ms ほどかかる）。
+-- 選択中のタブがフォルダ以外（コンピュータ、「最近の項目」など）を表示しているときと、
+-- Finder 以外のウィンドウは、キャプチャと同じく title に書く
+local function layoutEntryFor(win)
+  local desc = windowDescriptor(win)
+  if not desc then return nil end
+  local entry = { bundleID = desc.bundleID, frame = desc.frame }
+  if desc.bundleID == FINDER_BUNDLE_ID then
+    local tab = readFinderTabs().byID[win:id()]
+    if tab and tab.key and tab.path then entry.finderTab = layoutPath(tab.path) end
+  end
+  if not entry.finderTab then entry.title = desc.title end
+  return entry
+end
+
+-- 既存の記述 existing が、これから書く記述 entry と同じウィンドウを同じ書き方で表すかを返す。
+-- finderTab どうしは同じフォルダ（fileIdentity が同じ）なら、title どうしは bundleID と
+-- title が同じなら真になる。titlePattern を持つ記述と cascade の記述は常に偽にする。
+-- これらは複数のウィンドウに一致しうる手書きの条件で、このウィンドウに合わせて移したり
+-- frame を書き換えたりすると、一致していた他のウィンドウの行き先まで変わるため
+local function sameLayoutEntry(existing, entry)
+  if existing.bundleID ~= entry.bundleID or existing.titlePattern or existing.cascade then
+    return false
+  end
+  if entry.finderTab then
+    local key = fileIdentity(entry.finderTab)
+    return key ~= nil and existing.finderTab ~= nil and fileIdentity(existing.finderTab) == key
+  end
+  return existing.finderTab == nil and existing.title == entry.title
+end
+
+-- 記述 entry を、レイアウト screens のうち、画面 uuid の Space sid に対応する Space に置く。
+-- 新しく足すときは、entry を複製せずにそのまま入れる。
+-- sameLayoutEntry で同じとみなす記述が既にあれば、新しく足さずにその記述を移し、
+-- frame を entry の値に更新する。記述の他のフィールド（note など）はそのまま残る。
+-- 成功すると、新しく足したら "added"、同じ Space にあった記述を更新したら "updated"、
+-- 別の Space から移したら "moved" を返し、screens を書き換える。
+-- 対応する Space がレイアウトに無いときは、screens を変えずに nil と理由を返す。
+--
+-- レイアウトの spaces はキャプチャした時点の並びなので、今の Space と添字では対応させない。
+-- user Space は、画面の中で何番目の user Space かで対応させる。この対応のさせ方は復元と同じである。
+-- フルスクリーンの Space は、手前にある user Space の数で位置を決める。その位置に
+-- フルスクリーンの Space の記述が既にあって同じ記述を含んでいれば、その Space で更新し、
+-- 無ければその位置の末尾にフルスクリーンの Space を新しく作る。
+-- 記述を移した結果、元のフルスクリーンの Space が空になったら、その Space も消す。
+-- 空のフルスクリーンの Space は、復元しても作られないので残す意味が無い。
+--
+-- screens の中のテーブルは、互いに共有されていないこと（deepCopy で複製したもの）。
+-- 共有されていると、1 つの Space に追加した記述が、同じテーブルを参照する全ての Space に現れる
+local function placeEntryInLayout(screens, uuid, sid, entry)
+  local screenData = screens[uuid]
+  if type(screenData) ~= "table" then return nil, "レイアウトにこの画面がありません" end
+  local spaces = screenData.spaces or {}
+
+  -- 今の Space の並びで、sid の手前にある user Space の数を数える
+  local isFS = spaceIsFullscreen(sid)
+  local usersAhead, found = 0, false
+  for _, s in ipairs(hs.spaces.spacesForScreen(uuid) or {}) do
+    if s == sid then found = true; break end
+    if not spaceIsFullscreen(s) then usersAhead = usersAhead + 1 end
+  end
+  if not found then return nil, "ウィンドウのいる Space が見つかりません" end
+
+  local function isUserSpace(sp) return (sp.type or "user") ~= "fullscreen" end
+  -- レイアウトの spaces で、添字 i より前にある user Space の数
+  local function usersBefore(i)
+    local n = 0
+    for j = 1, i - 1 do
+      if isUserSpace(spaces[j]) then n = n + 1 end
+    end
+    return n
+  end
+  local userCount = usersBefore(#spaces + 1)
+
+  -- user Space なら、置く先の Space を書き換える前に決める
+  local target = nil
+  if isFS then
+    if usersAhead > userCount then
+      return nil, string.format("レイアウトの user Space が %d 個しかありません", userCount)
+    end
+  else
+    for i, sp in ipairs(spaces) do
+      if isUserSpace(sp) and usersBefore(i) == usersAhead then target = sp; break end
+    end
+    if not target then
+      return nil, string.format(
+        "レイアウトの user Space が %d 個しかありません（ウィンドウは %d 番目の user Space にあります）",
+        userCount, usersAhead + 1)
+    end
+  end
+
+  -- 同じ記述を探す。複数あれば、画面の UUID 順・Space 順・記述順で最初のものを使う
+  local uuids = {}
+  for u in pairs(screens) do table.insert(uuids, u) end
+  table.sort(uuids)
+  local old = nil   -- { screen, space, index }
+  for _, u in ipairs(uuids) do
+    for _, sp in ipairs(screens[u].spaces or {}) do
+      for i, d in ipairs(sp.windows or {}) do
+        if not old and sameLayoutEntry(d, entry) then
+          old = { screen = u, space = sp, index = i }
+        end
+      end
+    end
+  end
+
+  -- 同じ Space に既にあれば、frame だけ更新する
+  if old then
+    local inPlace = false
+    if not isFS then
+      inPlace = (old.space == target)
+    elseif old.screen == uuid and not isUserSpace(old.space) then
+      for i, sp in ipairs(spaces) do
+        if sp == old.space then inPlace = (usersBefore(i) == usersAhead); break end
+      end
+    end
+    if inPlace then
+      old.space.windows[old.index].frame = entry.frame
+      return "updated"
+    end
+  end
+
+  -- 別の Space にあれば、元の位置から取り除いて移す
+  local item = entry
+  if old then
+    item = table.remove(old.space.windows, old.index)
+    item.frame = entry.frame
+    if not isUserSpace(old.space) and #old.space.windows == 0 then
+      local oldSpaces = screens[old.screen].spaces
+      for i, sp in ipairs(oldSpaces) do
+        if sp == old.space then table.remove(oldSpaces, i); break end
+      end
+    end
+  end
+
+  if isFS then
+    -- usersAhead 番目の user Space の直後から、後に続くフルスクリーンの Space を飛ばした位置
+    local pos = 0
+    for i, sp in ipairs(spaces) do
+      if isUserSpace(sp) and usersBefore(i) + 1 == usersAhead then pos = i; break end
+    end
+    while spaces[pos + 1] and not isUserSpace(spaces[pos + 1]) do pos = pos + 1 end
+    table.insert(spaces, pos + 1, { type = "fullscreen", windows = { item } })
+    screenData.spaces = spaces
+  else
+    target.windows = target.windows or {}
+    table.insert(target.windows, item)
+  end
+  return old and "moved" or "added"
+end
+
+-- アクティブなウィンドウ 1 枚を、現在の構成のレイアウトファイルに記録する。
+-- 記述はウィンドウが今いる Space に置き、同じ記述が既にあればそれを移して frame を更新する
+-- （記述の書き方は layoutEntryFor、置き方は placeEntryInLayout を参照）。
+-- 記録できたら true を返し、結果をアラートとコンソールで知らせる。
+-- キャプチャか復元の最中、アクティブな標準のウィンドウが無い、現在の構成のファイルが無い、
+-- ignore に一致する、置く Space がレイアウトに無い、のいずれかのときは、ファイルを変えずに
+-- 理由をアラートとコンソールで知らせ、false を返す。
+-- キャプチャと違って Space を切り替えないので、他のウィンドウの記述には触れない
+function obj:addActiveWindow()
+  local function fail(message)
+    hs.alert.show("SpaceSaver: " .. message)
+    print("SpaceSaver: アクティブなウィンドウを追加できません: " .. message)
+    return false
+  end
+  if busy then return fail("キャプチャか復元の最中です") end
+
+  local win = hs.window.focusedWindow()
+  local isStd = false
+  if win then pcall(function() isStd = win:isStandard() end) end
+  if not isStd then return fail("アクティブなウィンドウがありません") end
+
+  local path, data = findConfigFile(currentScreenSet())
+  if not path then return fail("現在の構成のファイルがありません。まずキャプチャしてください") end
+
+  local entry = layoutEntryFor(win)
+  if not entry then return fail("ウィンドウの情報を取得できません") end
+  if isIgnored(data.ignoreEffective, entry.bundleID, win:title() or "") then
+    return fail("ignore に一致するウィンドウです")
+  end
+
+  local okSpaces, spaces = pcall(hs.spaces.windowSpaces, win)
+  local sid = okSpaces and type(spaces) == "table" and spaces[1] or nil
+  local uuid = sid and hs.spaces.spaceDisplay(sid)
+  if not uuid then return fail("ウィンドウのいる Space が分かりません") end
+
+  local screens = deepCopy(data.screens)
+  local action, reason = placeEntryInLayout(screens, uuid, sid, entry)
+  if not action then return fail(reason) end
+  -- 失敗したときは saveConfigFile がアラートを出す
+  if not saveConfigFile(path, screens, data.ignore) then return false end
+
+  local name, file = entry.finderTab or entry.title, basename(path)
+  local message = ({
+    added   = "%s を [%s] に追加しました",
+    updated = "%s の frame を [%s] で更新しました",
+    moved   = "%s の記述を [%s] で今の Space へ移しました",
+  })[action]
+  print(string.format("SpaceSaver: " .. message .. " %s screen=[%s] spaceID=[%s]",
+    name, file, descKeyLabel(entry), uuid, tostring(sid)))
+  hs.alert.show(string.format("SpaceSaver: " .. message, name, file))
+  return true
+end
+
+-- ============================================================
 -- 復元
 -- ============================================================
 
@@ -1908,6 +2151,10 @@ updateMenu = function()
       title = "レイアウトをキャプチャ",
       fn = function() obj:capture() end,
     },
+    {
+      title = "アクティブなウィンドウを追加",
+      fn = function() obj:addActiveWindow() end,
+    },
     { title = "-" },
     {
       title = "現在の構成: " .. label,
@@ -1966,17 +2213,20 @@ end
 
 -- ホットキーを SpaceSaver の各アクションに割り当てる。
 -- mapping は次のキーを持つテーブル（いずれも任意）:
---   capture: レイアウトをキャプチャ（hammerspoon://space-capture と同じ）
---   restore: レイアウトを復元（hammerspoon://space-restore と同じ）
+--   capture:   レイアウトをキャプチャ（hammerspoon://space-capture と同じ）
+--   restore:   レイアウトを復元（hammerspoon://space-restore と同じ）
+--   addWindow: アクティブなウィンドウを追加（hammerspoon://space-add-window と同じ）
 -- 例:
 --   spoon.SpaceSaver:bindHotkeys({
---     capture = {{"cmd","alt","ctrl"}, "c"},
---     restore = {{"cmd","alt","ctrl"}, "r"},
+--     capture   = {{"cmd","alt","ctrl"}, "c"},
+--     restore   = {{"cmd","alt","ctrl"}, "r"},
+--     addWindow = {{"cmd","alt","ctrl"}, "a"},
 --   })
 function obj:bindHotkeys(mapping)
   local spec = {
-    capture = hs.fnutils.partial(self.capture, self),
-    restore = hs.fnutils.partial(restoreCurrentConfig),
+    capture   = hs.fnutils.partial(self.capture, self),
+    restore   = hs.fnutils.partial(restoreCurrentConfig),
+    addWindow = hs.fnutils.partial(self.addActiveWindow, self),
   }
   hs.spoons.bindHotkeysToSpec(spec, mapping)
   return self
@@ -2006,6 +2256,7 @@ function obj:start()
   -- URLイベント（シェルから open -g "hammerspoon://space-capture" で起動可）
   hs.urlevent.bind("space-capture", function() obj:capture() end)
   hs.urlevent.bind("space-restore", function() restoreCurrentConfig() end)
+  hs.urlevent.bind("space-add-window", function() obj:addActiveWindow() end)
 
   -- スクリーンウォッチャー（デバウンスのあと、構成が落ち着くのを待って復元）
   screenWatcher = hs.screen.watcher.new(function()
@@ -2027,6 +2278,7 @@ function obj:stop()
   if windowFilter  then windowFilter:delete();          windowFilter = nil end
   hs.urlevent.bind("space-capture", nil)
   hs.urlevent.bind("space-restore", nil)
+  hs.urlevent.bind("space-add-window", nil)
   print("SpaceSaver: 停止")
   return self
 end

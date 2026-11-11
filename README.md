@@ -140,6 +140,44 @@ open -g "hammerspoon://space-capture"
 
 初回キャプチャで、データディレクトリ（デフォルト `~/.hammerspoon/`）に `space_layouts_1.yaml` が生成されます。
 
+### アクティブなウィンドウだけを追加する
+
+いまアクティブなウィンドウ 1 枚だけを、現在の構成の YAML に記録します。Space を巡回しないので、画面は切り替わりません。他のウィンドウの記述には触れません。
+
+```bash
+# メニューバーのアイコンから
+⊞ > アクティブなウィンドウを追加
+
+# シェルから（-g を付けると、アクティブなウィンドウが変わらない）
+open -g "hammerspoon://space-add-window"
+```
+
+記述は、ウィンドウがいまいる Space に置きます。書き方はウィンドウによって変わります。
+
+| ウィンドウ | 記録する記述 |
+|---|---|
+| Finder | 選択中のタブが表示しているフォルダを `finderTab` に書く（→ [Finder のタブ](#finder-のタブfindertab)）。ホームディレクトリは `~` で書く |
+| Finder で、選択中のタブがフォルダ以外（コンピュータ、「最近の項目」など）を表示している | キャプチャと同じく `title` に書く |
+| Finder 以外 | キャプチャと同じく `title` に書く |
+
+```yaml
+# Finder のウィンドウを追加した例
+- bundleID: com.apple.finder
+  finderTab: ~/Library/CloudStorage/Dropbox/Music
+  frame: { x: 2639, y: 51, w: 1093, h: 1569 }
+```
+
+同じウィンドウの記述が既にあれば、新しく足さずにその記述を使います。Finder なら同じフォルダの `finderTab` の記述、それ以外なら同じ `bundleID` と `title` の記述が対象です。その記述がいまの Space にあれば `frame` だけを更新し、別の Space にあればいまの Space へ移します。手で書いた `note` などのフィールドは残ります。`titlePattern` の記述と `cascade: true` の記述は、他のウィンドウにも一致する手書きの条件なので書き換えません。新しい記述を足します。
+
+Space は、画面の中で何番目の user Space かで YAML と対応させます（復元と同じ）。ウィンドウがフルスクリーンの Space にあるときは、手前の user Space の数で位置を決め、そこに `type: fullscreen` の Space を新しく作ります。次の場合は記録せずに、理由をアラートで知らせます。
+
+- 現在の構成の YAML が無い（先にキャプチャしてください）
+- ウィンドウが `ignore` に一致する
+- ウィンドウのいる user Space が YAML に無い（YAML の user Space が足りない）
+- キャプチャか復元の最中
+
+ファイルは YAML 全体を書き直すので、キャプチャと同じく YAML に書いたコメントは残りません。
+
 ### 設定ファイルの手動編集
 
 生成された YAML を手動で編集することで、可変タイトルへの対応や細かい調整ができます：
@@ -210,12 +248,13 @@ spoon.SpaceSaver:dump()
 
 ### ホットキー（任意）
 
-`bindHotkeys` でキャプチャ／復元にショートカットを割り当てられます。デフォルトの割り当てはありません（他の Spoon やシステムとの衝突を避けるため）。
+`bindHotkeys` でキャプチャ／復元／アクティブなウィンドウの追加にショートカットを割り当てられます。デフォルトの割り当てはありません（他の Spoon やシステムとの衝突を避けるため）。
 
 ```lua
 spoon.SpaceSaver:bindHotkeys({
-  capture = {{"cmd", "alt", "ctrl"}, "c"},  -- レイアウトをキャプチャ
-  restore = {{"cmd", "alt", "ctrl"}, "r"},  -- レイアウトを復元
+  capture   = {{"cmd", "alt", "ctrl"}, "c"},  -- レイアウトをキャプチャ
+  restore   = {{"cmd", "alt", "ctrl"}, "r"},  -- レイアウトを復元
+  addWindow = {{"cmd", "alt", "ctrl"}, "a"},  -- アクティブなウィンドウを追加
 })
 ```
 
