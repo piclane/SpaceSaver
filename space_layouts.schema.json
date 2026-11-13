@@ -51,7 +51,7 @@
         },
         "titlePattern": {
           "type": "string",
-          "description": "ウィンドウタイトルのLuaパターン。titleより優先される。"
+          "description": "ウィンドウタイトルのLuaパターン。titleより優先される。- は文字として照合する（Luaパターン本来の最短一致の繰り返しには使えない。繰り返しは * で書く）。"
         },
         "note": {
           "type": "string",
@@ -121,7 +121,7 @@
         },
         "titlePattern": {
           "type": "string",
-          "description": "ウィンドウタイトルのLuaパターン (例: '^MyApp - ')。可変タイトルのアプリに手動で追記する。titleより優先される。パターンに一致するウィンドウが全て対象になる。Luaパターン記法（PCREとは一部異なる）。"
+          "description": "ウィンドウタイトルのLuaパターン (例: '^MyApp - ')。可変タイトルのアプリに手動で追記する。titleより優先される。パターンに一致するウィンドウが全て対象になる。Luaパターン記法（PCREとは一部異なる）。ただし - は文字として照合する（Luaパターン本来の最短一致の繰り返しには使えない。繰り返しは * で書く）。"
         },
         "finderTab": {
           "type": "string",

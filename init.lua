@@ -72,7 +72,8 @@
       （Spaceをまたぐ移動が必要な場合のみ使用。割当はOS設定から自動検出する）
 
   既知の制限:
-    - Luaパターン照合（完全なPCREではない）
+    - Luaパターン照合（完全なPCREではない）。ただし titlePattern の - は文字として照合する。
+      Lua パターン本来の「0 回以上の最短一致」としては使えないので、繰り返しは * で書く
     - フルスクリーンSpaceの並び順も復元する。新しいフルスクリーンSpaceは
       必ず画面の末尾に作られるため、Mission Controlでサムネイルをドラッグして直す
       （restoreFullscreenSpaceOrder=false で無効化できる）
@@ -740,10 +741,52 @@ local function windowDescriptor(win)
   return ok and r or nil
 end
 
--- desc の titlePattern (Luaパターン) または title でキャッシュ済みタイトル文字列を照合する
+-- titlePattern の値を、- を文字として照合する Lua パターンに変換して返す。
+-- 文字クラス [...] の外にあり、% でエスケープされていない - を %- に置き換える。
+-- Lua パターンの - は「直前の 1 文字を 0 回以上（最短一致）」を表すので、
+-- 'my-app' のようなタイトルを書いたとおりに照合できない。
+-- 照合は一致の有無しか見ないので、最短一致の - と最長一致の * は結果が変わらず、
+-- 繰り返しは * で書ける。
+-- 既に %- と書いた - と、[a-z] のような文字クラスの中の範囲指定は変えない。
+-- pat が文字列でなければ、そのまま返す。
+-- 閉じていない [ や末尾の % のような不正なパターンは、不正なまま返す
+local function toLuaPattern(pat)
+  if type(pat) ~= "string" then return pat end
+  local out, i, n = {}, 1, #pat
+  while i <= n do
+    local c = pat:sub(i, i)
+    if c == "%" then
+      -- %bxy は区切りの 2 文字まで、それ以外の %x は次の 1 文字までが 1 つの記法
+      local len = (pat:sub(i + 1, i + 1) == "b") and 4 or 2
+      table.insert(out, pat:sub(i, i + len - 1))
+      i = i + len
+    elseif c == "[" then
+      -- Lua と同じく、[ と [^ の直後の 1 文字は ] でも閉じ括弧とみなさず、
+      -- %] のようなエスケープを読み飛ばしながら閉じ括弧を探す
+      local j = i + 1
+      if pat:sub(j, j) == "^" then j = j + 1 end
+      repeat
+        if pat:sub(j, j) == "%" then j = j + 1 end
+        j = j + 1
+      until j > n or pat:sub(j, j) == "]"
+      table.insert(out, pat:sub(i, j))
+      i = j + 1
+    elseif c == "-" then
+      table.insert(out, "%-")
+      i = i + 1
+    else
+      table.insert(out, c)
+      i = i + 1
+    end
+  end
+  return table.concat(out)
+end
+
+-- desc の titlePattern (toLuaPattern で変換した Lua パターン) または title で
+-- キャッシュ済みタイトル文字列を照合する
 local function titleMatches(desc, actualTitle)
   if desc.titlePattern then
-    return string.find(actualTitle, desc.titlePattern) ~= nil
+    return string.find(actualTitle, toLuaPattern(desc.titlePattern)) ~= nil
   end
   return actualTitle == (desc.title or "")
 end
@@ -764,7 +807,7 @@ local function descMatches(desc, actual, folders)
   return titleMatches(desc, actual.title)
 end
 
--- titlePattern の「自由度の低さ」を数える。
+-- Lua パターンの「自由度の低さ」を数える。
 -- 必ず一致しなければならないリテラル文字を数え、位置を固定するアンカーを加点する。
 -- '.*' は 0、'^SpaceSaver.spoon – ' は 20 前後になる。
 -- 厳密な尺度ではなく、どちらがより具体的かを比べるための目安。
@@ -807,7 +850,7 @@ end
 -- title の完全一致はどのパターンより強い
 local function descSpecificity(desc)
   if desc.finderTab then return math.huge end
-  if desc.titlePattern then return patternSpecificity(desc.titlePattern) end
+  if desc.titlePattern then return patternSpecificity(toLuaPattern(desc.titlePattern)) end
   return 1000 + #(desc.title or "")
 end
 
